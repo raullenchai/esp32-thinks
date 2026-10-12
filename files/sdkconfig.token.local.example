@@ -1,0 +1,14 @@
+# Written by esp32-thinks apply.sh — this file is your local overlay and stays untracked.
+
+# Your Muse gadget token: create a gadget at https://gadgets.muse.ai and copy its token.
+CONFIG_GADGET_SDK_TOKEN="mgst_YOUR_TOKEN_HERE"
+
+# Chinese (CJK) captions on the display. The Unifont font ships with the SDK but adds
+# ~6.8 MB to the firmware — default is Latin glyphs only. Uncomment for Chinese captions:
+# CONFIG_MUSE_CJK_FONT=y
+#
+# After changing this file, delete the build's sdkconfig so it regenerates:
+#   rm build-muse-sensecap-watcher/sdkconfig && ./build-and-flash.sh <sdk>
+
+# Your OpenAI API key is written into the patched muse_chat_session.cpp (TTS_API_KEY) by apply.sh.
+# To change the voice/model later, edit TTS_VOICE / TTS_MODEL in that file and re-flash.
