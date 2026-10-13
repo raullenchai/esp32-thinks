@@ -1,4 +1,6 @@
-<img width="358" height="341" alt="Screenshot 2026-10-12 at 6 21 43 PM" src="https://github.com/user-attachments/assets/ee7031ee-0ad3-4559-ad28-30c26c858a9c" />
+<p align="center">
+  <img width="340" alt="esp32-thinks" src="https://github.com/user-attachments/assets/ee7031ee-0ad3-4559-ad28-30c26c858a9c" />
+</p>
 
 # esp32-thinks
 
