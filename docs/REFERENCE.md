@@ -1,6 +1,8 @@
 # Reference
 
-Everything this recipe learned the hard way. Tested with **muse-gadget-sdk @ `812c46f`** (2026-10-09) and **ESP-IDF v6.0.1** on an esp32s3 target. Newer revisions likely work — run `git rev-parse --short HEAD` in the SDK to compare.
+The full story of **esp32-thinks** — a multi-model Muse: a personal AI voice assistant on ESP32 with a brain you choose (three independent OpenAI-compatible endpoints) and an on-chip wake word. This document follows the project's timeline: the v0.1 TTS hook, the v0.2 brain, and the v0.2.1 wake word — with every gotcha found the hard way along the way. For the pitch and the quick start, see the [README](../README.md).
+
+Everything here was learned on real hardware. Tested with **muse-gadget-sdk @ `812c46f`** (2026-10-09) and **ESP-IDF v6.0.1** on an esp32s3 target. Newer revisions likely work — run `git rev-parse --short HEAD` in the SDK to compare.
 
 ## What the patch changes
 

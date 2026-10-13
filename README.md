@@ -4,6 +4,13 @@
 
 # esp32-thinks
 
+<p align="center">
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-green"></a>
+  <img alt="ESP-IDF v6.0.1" src="https://img.shields.io/badge/ESP--IDF-v6.0.1-blue">
+  <img alt="board" src="https://img.shields.io/badge/board-SenseCAP%20Watcher-black">
+  <a href="https://github.com/raullenchai/esp32-thinks/pull/2"><img alt="v0.2" src="https://img.shields.io/badge/status-v0.2.1-orange"></a>
+</p>
+
 **A multi-model Muse — a personal AI assistant on ESP32, talking out of the box.**
 
 Think of it as a Muse that thinks with **your** models: say **"Hi, ESP"** (or press the knob), ask anything, and it answers **out loud** — streaming sentence-by-sentence while the model is still writing, in English or Chinese, on a $50 gadget with a mic, a speaker and a round display.
@@ -113,7 +120,7 @@ Latency receipts (warm, measured on device, QuickSilver preset): transcription 3
 ## Security notes
 
 - **API keys are compiled into the firmware.** This is a hobby recipe, not a multi-tenant product — don't flash keys you aren't comfortable with into a device that leaves your bench, and don't commit `provider_config.h` (it's generated; `apply.sh` keeps it out of the repo).
-- Each endpoint pins its root CA (`files/*.pem`); the ESP cert bundle alone doesn't carry them (the v0.1 story — see [REFERENCE](docs/REFERENCE.md#the-three-blockers) — now with a second root for Let's Encrypt hosts).
+- Each endpoint pins its root CA (`files/*.pem`); the ESP cert bundle alone doesn't carry them (the v0.1 story — see [REFERENCE](docs/REFERENCE.md#security) — now with a second root for Let's Encrypt hosts).
 - Voice is recorded only during a turn (button held, or after the wake word until the VAD closes it). With a headless token placeholder the Muse cloud is never contacted.
 
 ## Roadmap
