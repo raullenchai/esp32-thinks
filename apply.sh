@@ -10,8 +10,12 @@ set -euo pipefail
 
 SDK=${1:?usage: ./apply.sh /path/to/muse-gadget-sdk [--preset openai|quicksilver|custom]}
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-PRESET=${2:---preset openai}
-PRESET=${PRESET/--preset /}
+PRESET="openai"
+if [ "${2:-}" = "--preset" ]; then
+    PRESET=${3:-openai}
+elif [ -n "${2:-}" ]; then
+    echo "unknown option: $2 (usage: ./apply.sh <sdk> [--preset openai|quicksilver|custom])"; exit 1
+fi
 
 test -d "$SDK/esp32/components/muse" || { echo "not a muse-gadget-sdk checkout: $SDK"; exit 1; }
 cd "$SDK"
