@@ -26,6 +26,12 @@ case "$OPENAI_KEY" in sk-*) ;; *) echo "that doesn't look like an OpenAI key"; e
 sed -i.bak "s/sk-proj-REPLACE-WITH-YOURS/$OPENAI_KEY/" esp32/components/muse/muse_chat_session.cpp
 rm -f esp32/components/muse/muse_chat_session.cpp.bak
 
+read -r -p "TTS voice [alloy]: " TTS_VOICE
+TTS_VOICE=${TTS_VOICE:-alloy}
+sed -i.bak "s/#define TTS_VOICE \"alloy\"/#define TTS_VOICE \"$TTS_VOICE\"/" esp32/components/muse/muse_chat_session.cpp
+rm -f esp32/components/muse/muse_chat_session.cpp.bak
+echo "== voice: $TTS_VOICE"
+
 read -r -p "Muse gadget token (mgst_..., from https://gadgets.muse.ai): " MUSE_TOKEN
 case "$MUSE_TOKEN" in mgst_*) ;; *) echo "that doesn't look like a Muse gadget token"; exit 1 ;; esac
 cat > esp32/sdkconfig.token.local <<EOF

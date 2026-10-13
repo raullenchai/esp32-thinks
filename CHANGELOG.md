@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.1 — 2026-10-12
+
+- **Stream the TTS audio while downloading** — `decode()` now runs from the HTTP event handler, so the device starts speaking as soon as the first MP3 frames land instead of after the full download (~1–2 s earlier first sound on Wi-Fi).
+- `apply.sh` now asks for a TTS voice (default `alloy`); the fetch logs its duration (`TTS ok: N bytes in X ms`) for receipts.
+
 ## v0.1.0 — 2026-10-12
 
 Initial recipe: **Seeed SenseCAP Watcher W1-B on muse-gadget-sdk @ `812c46f` (2026-10-09), ESP-IDF v6.0.1.**

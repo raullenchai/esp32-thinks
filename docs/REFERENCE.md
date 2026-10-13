@@ -7,7 +7,7 @@ Everything this recipe learned the hard way. Tested with **muse-gadget-sdk @ `81
 Three files in `esp32/components/muse/`, all in the SDK's own extension points:
 
 - **`muse_chat_session.cpp`**
-  - `tts_fetch_openai()` + `tts_http_event()`: POSTs the reply text to `https://api.openai.com/v1/audio/speech` (`response_format: mp3`), streaming the response into the SDK's existing `tts_data()` buffer (512 KB in PSRAM).
+  - `tts_fetch_openai()` + `tts_http_event()`: POSTs the reply text to `https://api.openai.com/v1/audio/speech` (`response_format: mp3`), streaming the response into the SDK's existing `tts_data()` buffer (512 KB in PSRAM) and calling `decode()` per chunk — the device speaks while the MP3 is still downloading. The fetch logs its duration (`TTS ok: N bytes in X ms`).
   - `start_tts()`: for a `TTS_QUEUED` message with text, sets up the documented TTS state (`mp3dec_init`, `silent = false`, …) and calls the fetch. On failure it falls back to the stock caption-paced silence, so a dead API key degrades to captions instead of a hung turn.
   - `message_done()`: the typed-turn branch (`s_turn.text`) returned before ever setting `TTS_QUEUED` — captions only by design. The patch makes the final text authoritative (copying it over partial accumulated text when they disagree) and queues TTS for both typed and voice turns.
   - `#define TTS_API_KEY / TTS_MODEL / TTS_VOICE` — your knobs.
@@ -79,7 +79,9 @@ Failure modes are graceful: a non-200 or a dropped connection resets the state a
 
 ## Changing voice / model
 
-Edit `TTS_VOICE` / `TTS_MODEL` in `muse_chat_session.cpp`, re-run `build-and-flash.sh`. Voices that read Chinese well: `alloy`, `nova`, `shimmer`, `echo`, `onyx` (see OpenAI's voice list). `gpt-4o-mini-tts` also works and accepts style instructions — wire the prompt in yourself if you want a persona.
+Edit `TTS_VOICE` / `TTS_MODEL` in `muse_chat_session.cpp`, re-run `build-and-flash.sh` — or set the voice once at `apply.sh` time (it prompts). Voices that read Chinese well: `alloy`, `nova`, `shimmer`, `echo`, `onyx` (see OpenAI's voice list). `gpt-4o-mini-tts` also works and accepts style instructions — wire the prompt in yourself if you want a persona.
+
+**Where the latency goes** (measured on a Watcher over 2.4 GHz Wi-Fi): Muse's cloud STT + LLM take ~5–8 s and are outside this recipe's control (swap the agent/backend for real gains); the TTS hop adds ~1–2 s to first sound with streaming enabled — TLS handshake to `api.openai.com` dominates it. Sentence-level TTS (speaking while the LLM is still writing) is a possible future cut, but replies are usually 1–3 sentences and the win is small.
 
 ## Swapping the brain
 
