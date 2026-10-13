@@ -59,7 +59,7 @@ cd esp32-thinks
 ./build-and-flash.sh ../muse-gadget-sdk /dev/ttyACM1
 ```
 
-With a preset + headless Wi-Fi in step 2, that's the whole setup: press the knob, talk, and it answers in its own voice. No Muse app unless you want the cloud agent as a fallback.
+With a preset + headless Wi-Fi in step 2, that's the whole setup: press the knob, talk, and it answers in its own voice — or just say **"Hi ESP"** (wake word, optional in step 2; the button always works too). No Muse app unless you want the cloud agent as a fallback.
 
 | Command | Does |
 |---|---|
@@ -101,8 +101,7 @@ Latency receipts (warm, measured on device): transcription 3.4 s, first sentence
 
 ## Roadmap
 
-- **Wake word** ("Hey Mica") — ESP-SR WakeNet10 runs on the S3; custom phrases are trainable via Espressif's TTS Pipeline V3. The mic pre-buffer is already streaming; the hook point is `muse_input.c`.
-- More boards the SDK supports (Waveshare, M5Stack…), full-duplex speech-to-speech models (QuickSilver's qwen3.8-omni), local LLMs.
+- More boards the SDK supports (Waveshare, M5Stack…), full-duplex speech-to-speech models (QuickSilver's qwen3.8-omni), local LLMs. *(Wake word is done — say "Hi ESP".)*
 
 Full story, exact code paths and every gotcha found the hard way: **[docs/REFERENCE.md](docs/REFERENCE.md)**.
 

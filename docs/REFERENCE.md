@@ -61,7 +61,7 @@ Changed `TTS_VOICE`/`TTS_MODEL`/the token? Just re-run `build-and-flash.sh` — 
 2. Account: the Muse app (phone) binds the device to your Muse account — the gadget token in `sdkconfig.token.local` is what your firmware presents.
 3. Verify: `python3 muse-gadget-sdk/esp32/tools/muse/chat.py --status` → expect `state: 'Connected'`, `link: Online`, and your SSID.
 
-No wake word anywhere: this is a **push-to-talk** device. Press the knob, talk, release. (That's also what makes it feel like an intercom rather than a smart speaker — by design.)
+By default this is a **push-to-talk** device — press the knob, talk, release, intercom style. `apply.sh` can also enable the **"Hi ESP" voice wake word** (see below); button and wake word then both start a turn.
 
 ## How the spoken reply flows
 
@@ -171,6 +171,15 @@ Server-side floors, measured from a laptop (Chinese prompt, streaming): deepseek
 - **Silence ≠ silence**: whisper on a quiet room returns `""` or `" ."`, which the brain reports as `BRAIN STT FAILED` — expected, not a bug.
 - **Placeholder token**: with headless provisioning the gadget's token (`brain-local`) is rejected by the Muse cloud (HTTP 401 in the log). Harmless: the brain never contacts it, and the stock agent is only a fallback you opted out of.
 
-## Wake word (roadmap)
+## Wake word ("Hi ESP")
 
-The mic pre-buffer already streams continuously (`PRE_CHUNKS`), so the hook point is `muse_input.c`: run ESP-SR **WakeNet10** (S3-supported, ~w8a16 quant) on the frames, and on detection synthesize a `MUSE_PTT_DOWN`. Recording stops via the existing silence detector instead of the knob release. For a custom phrase like "Hey Mica", Espressif's TTS Pipeline V3 trains WakeNet models from TTS samples (see esp-sr issue #88); prebuilt models ship for "Hi ESP", "你好小智", Alexa and others. Untested in this recipe — the PTT knob remains the documented path.
+Implemented (v0.2.1): `apply.sh` asks *"Enable the 'Hi ESP' voice wake word?"* — say **"Hi ESP"** or hold the knob, both start a turn. The knob path is untouched; detection merely synthesizes a `MUSE_PTT_DOWN` into the same input queue, so recording, VAD end-of-speech and the reply flow are exactly the button's.
+
+How it fits together:
+
+- **esp-sr 2.6.0 + esp-dl kernels**: `idf_component.yml` adds esp-sr; `wn10_hiesp` ("Hi, ESP", 984 KB) is enabled in `sdkconfig.muse` and packed into `srmodels.bin` by `idf.py` (needs `MODEL_IN_FLASH`). `partitions_muse.csv` gains a `model` partition at 0x822000 — the Watcher's 32 MB flash has room; **flash `srmodels.bin` there once** (`build-and-flash.sh` does; it must be a separate esptool command — combined with `@flash_args` esptool reports a false overlap at 0x822000).
+- **Direct WakeNet, no AFE**: the AFE audio-front-end's static buffers (~34 KB internal BSS) OOM the codec on this board — `muse_voice.c` calls WakeNet's `create/detect` directly on the 20 ms idle chunks (512-frame aggregation), skipping AFE entirely.
+- **A missing kernel gotcha**: esp-sr's `compile_req` strips esp-dl to the kernels *its own* models use — the `wn10_hiesp` 1x1 W8A16 conv **without bias** (`0x0202`) isn't among them, and every `detect()` fails with `no Conv kernel for packed key 0x0202`. `dl-extra-req.yml` re-adds it via esp-dl's multi-component req union.
+- **Self-test**: serial `k` plays the embedded wake phrase and records **in lockstep** (full duplex) — a blocking playback would miss its own wake word; `muse_audio` loopback (`l`) confirms both mic channels.
+- End-of-turn for wake-initiated recording is the energy VAD (`WAKE_VAD_DB`, -45 dBFS, 1.4 s of quiet); a 4 s cooldown after each turn keeps the reply's tail from re-waking the device. Raise `WAKE_VAD_DB` toward -35 if it keeps recording after you stop.
+- Custom phrase ("Hey Mica"): Espressif's TTS Pipeline V3 trains WakeNet models from TTS samples (esp-sr issue #88) — drop the trained model into the `model` partition. Prebuilt models ship for "Hi ESP", "你好小智", Alexa and others.

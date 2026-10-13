@@ -110,6 +110,12 @@ read -r -p "Enable Chinese (CJK) captions? [y/N]: " CJK || true
 case "${CJK:-}" in y|Y) echo "CONFIG_MUSE_CJK_FONT=y" >> esp32/sdkconfig.token.local
     echo "== CJK font on (adds ~6.8 MB to the firmware)" ;; esac
 
+# 5b) Voice wake word: say "Hi ESP" (WakeNet10, esp-sr) or press the button --
+#     both start a turn. Needs a `model` flash partition for the wake model.
+read -r -p "Enable the \"Hi ESP\" voice wake word (button PTT still works)? [Y/n]: " WAKE || true
+case "${WAKE:-y}" in n|N) WAKE_WORD=0; echo "== wake word off (button PTT only)" ;;
+    *) WAKE_WORD=1; echo "== wake word on: say \"Hi ESP\", or hold the button" ;; esac
+
 # 6) Write the config the patch reads.
 cat > esp32/components/muse/provider_config.h <<EOF
 /*
@@ -154,6 +160,14 @@ cat > esp32/components/muse/provider_config.h <<EOF
  * behavior. */
 #define DEV_WIFI_SSID "$DEV_SSID"
 #define DEV_WIFI_PASS "$DEV_PASS"
+
+/* --- Voice wake word ("Hi ESP", esp-sr WakeNet10) ---
+ * 1 = wake word + button both start a turn; 0 = button only. The wake model
+ * lives in the model flash partition (partitions_muse.csv, flashed as
+ * srmodels.bin). WAKE_VAD_DB ends a wake-word turn after this many dBFS of
+ * silence (raise toward -35 if it keeps recording after you stop). */
+#define WAKE_WORD $WAKE_WORD
+#define WAKE_VAD_DB (-45.0f)
 EOF
 echo "== provider_config.h written ($PRESET preset)"
 
