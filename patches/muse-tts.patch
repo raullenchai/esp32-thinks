@@ -6,7 +6,7 @@ index c3e7013..64ccbcf 100644
      SRCS ${srcs}
      INCLUDE_DIRS "."
      EMBED_FILES ${embed}
-+    EMBED_TXTFILES "openai_root_ca.pem"
++    EMBED_TXTFILES "tts_root_ca.pem"
      WHOLE_ARCHIVE   # muse_lv_mem.c provides symbols only LVGL references
      REQUIRES esp_driver_gpio esp_driver_i2c
      PRIV_REQUIRES ${muse_priv_requires}
@@ -22,19 +22,20 @@ index a6ad810..60afad4 100644
  #include "esp_log.h"
  #include "esp_random.h"
  #include "esp_timer.h"
-@@ -101,6 +102,11 @@ static const char *TAG = "muse_chat_session";
+@@ -101,6 +102,12 @@ static const char *TAG = "muse_chat_session";
  #define TEXT_MAX 1024                      /* a message's text, for captions timed to its speech */
  #define SPEECH_CHARS_PER_S 14              /* until the speech's length is known */
  #define TEXT_CHARS_PER_S 16                /* speaker off: reading pace, a little over speech */
 +
-+/* OpenAI TTS: speaks gadget replies instead of caption-paced silence. */
-+#define TTS_API_KEY "sk-proj-REPLACE-WITH-YOURS"
-+#define TTS_MODEL "tts-1"
-+#define TTS_VOICE "nova"
++/* TTS: speaks gadget replies instead of caption-paced silence. */
++#define TTS_API_KEY "REPLACE-WITH-YOURS"
++#define TTS_URL "https://api.quicksilverpro.io/v1/audio/speech"
++#define TTS_MODEL "chatterbox-turbo"
++#define TTS_VOICE "alloy"
  #define TEXT_HOLD_S 2                      /* speaker off: how long a message's last lines stay up */
  
  #define PING_US (20 * 1000000LL)
-@@ -1382,6 +1388,17 @@ static void message_done(int i, const char *final_text)
+@@ -1382,6 +1389,17 @@ static void message_done(int i, const char *final_text)
          if (final_text && final_text[0] && strlen(final_text) != m.len) {
              n = strlen(final_text);
              muse_hatch_console("final", final_text, "\"msg\":%d", i);
@@ -52,19 +53,18 @@ index a6ad810..60afad4 100644
          }
          muse_hatch_console("message_done", nullptr, "\"msg\":%d,\"bytes\":%u", i, (unsigned)n);
          ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)n);
-@@ -1499,6 +1516,69 @@ static void on_chat_ack(stream_t *s)
+@@ -1499,6 +1517,67 @@ static void on_chat_ack(stream_t *s)
      emit(MUSE_HATCH_EV_SENT, nullptr);
  }
  
-+/* ---- TTS: speaks gadget replies via OpenAI ---- */
++/* ---- TTS: speaks gadget replies ---- */
 +
 +static void tts_data(const uint8_t *data, size_t len);
 +
-+extern const uint8_t openai_root_ca_pem_start[] asm("_binary_openai_root_ca_pem_start");
-+extern const uint8_t openai_root_ca_pem_end[] asm("_binary_openai_root_ca_pem_end");
++extern const uint8_t tts_root_ca_pem_start[] asm("_binary_tts_root_ca_pem_start");
++extern const uint8_t tts_root_ca_pem_end[] asm("_binary_tts_root_ca_pem_end");
 +
 +static void decode(void);
-+extern const uint8_t openai_root_ca_pem_end[] asm("_binary_openai_root_ca_pem_end");
 +
 +static esp_err_t tts_http_event(esp_http_client_event_t *evt)
 +{
@@ -76,10 +76,9 @@ index a6ad810..60afad4 100644
 +    return ESP_OK;
 +}
 +
-+/* Streams one message MP3 from OpenAI into tts_data(); true on success. */
-+static bool tts_fetch_openai(const char *text)
++/* Streams one message MP3 into tts_data(); true on success. */
++static bool tts_fetch(const char *text)
 +{
-+    static const char *URL = "https://api.openai.com/v1/audio/speech";
 +    int64_t t0 = now_us();
 +
 +    cJSON *root = cJSON_CreateObject();
@@ -97,9 +96,9 @@ index a6ad810..60afad4 100644
 +    }
 +
 +    esp_http_client_config_t cfg = {};
-+    cfg.url = URL;
++    cfg.url = TTS_URL;
 +    cfg.method = HTTP_METHOD_POST;
-+    cfg.cert_pem = (const char *)openai_root_ca_pem_start;
++    cfg.cert_pem = (const char *)tts_root_ca_pem_start;
 +    cfg.timeout_ms = 15000;
 +    cfg.event_handler = tts_http_event;
 +    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
@@ -122,7 +121,7 @@ index a6ad810..60afad4 100644
  /* ---- Turn: speech ---- */
  
  static void start_tts(void)
-@@ -1526,6 +1606,34 @@ static void start_tts(void)
+@@ -1526,6 +1605,34 @@ static void start_tts(void)
           * end. decode() plays it at the speaker's volume, captions following,
           * and finishes the message once it's drained.
           */
@@ -140,7 +139,7 @@ index a6ad810..60afad4 100644
 +            mp3dec_init(&s_turn.dec);
 +            ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
 +            show_reply_start(m);
-+            if (tts_fetch_openai(text)) {
++            if (tts_fetch(text)) {
 +                s_turn.mp3_ended = true;
 +            } else {
 +                s_turn.mp3_len = 0;

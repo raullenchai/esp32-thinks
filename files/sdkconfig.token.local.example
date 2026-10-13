@@ -10,5 +10,7 @@ CONFIG_GADGET_SDK_TOKEN="mgst_YOUR_TOKEN_HERE"
 # After changing this file, delete the build's sdkconfig so it regenerates:
 #   rm build-muse-sensecap-watcher/sdkconfig && ./build-and-flash.sh <sdk>
 
-# Your OpenAI API key is written into the patched muse_chat_session.cpp (TTS_API_KEY) by apply.sh.
-# To change the voice/model later, edit TTS_VOICE / TTS_MODEL in that file and re-flash.
+# Your TTS API key is written into the patched muse_chat_session.cpp (TTS_API_KEY) by apply.sh.
+# Default: QuickSilver Pro, English (chatterbox-turbo). Choose zh for qwen3-tts (Chinese / mixed),
+# or openai for the OpenAI model / voice prompts. Provider changes need a matching URL + root CA:
+# re-run apply.sh, then build-and-flash.sh. TTS_URL / TTS_MODEL / TTS_VOICE live in the same file.

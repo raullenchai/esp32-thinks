@@ -1,27 +1,59 @@
 # Reference
 
-Everything this recipe learned the hard way. Tested with **muse-gadget-sdk @ `812c46f`** (2026-10-09) and **ESP-IDF v6.0.1** on an esp32s3 target. Newer revisions likely work — run `git rev-parse --short HEAD` in the SDK to compare.
+Everything this recipe learned the hard way. Original recipe tested with **muse-gadget-sdk @ `812c46f`** (2026-10-09) and **ESP-IDF v6.0.1** on an esp32s3 target. Newer revisions likely work — run `git rev-parse --short HEAD` in the SDK to compare.
 
 ## What the patch changes
 
 Three files in `esp32/components/muse/`, all in the SDK's own extension points:
 
 - **`muse_chat_session.cpp`**
-  - `tts_fetch_openai()` + `tts_http_event()`: POSTs the reply text to `https://api.openai.com/v1/audio/speech` (`response_format: mp3`), streaming the response into the SDK's existing `tts_data()` buffer (512 KB in PSRAM) and calling `decode()` per chunk — the device speaks while the MP3 is still downloading. The fetch logs its duration (`TTS ok: N bytes in X ms`).
+  - `tts_fetch()` + `tts_http_event()`: POSTs the reply text to `TTS_URL` (`https://api.quicksilverpro.io/v1/audio/speech` by default, or `https://api.openai.com/v1/audio/speech`) (`response_format: mp3`), streaming the response into the SDK's existing `tts_data()` buffer (512 KB in PSRAM) and calling `decode()` per chunk — the device speaks while the MP3 is still downloading. The fetch logs its duration (`TTS ok: N bytes in X ms`).
   - `start_tts()`: for a `TTS_QUEUED` message with text, sets up the documented TTS state (`mp3dec_init`, `silent = false`, …) and calls the fetch. On failure it falls back to the stock caption-paced silence, so a dead API key degrades to captions instead of a hung turn.
   - `message_done()`: the typed-turn branch (`s_turn.text`) returned before ever setting `TTS_QUEUED` — captions only by design. The patch makes the final text authoritative (copying it over partial accumulated text when they disagree) and queues TTS for both typed and voice turns.
-  - `#define TTS_API_KEY / TTS_MODEL / TTS_VOICE` — your knobs.
-- **`CMakeLists.txt`** — `EMBED_TXTFILES "openai_root_ca.pem"` (the pinned CA).
+  - `#define TTS_API_KEY / TTS_URL / TTS_MODEL / TTS_VOICE` — your knobs.
+- **`CMakeLists.txt`** — `EMBED_TXTFILES "tts_root_ca.pem"` (the provider's pinned CA, copied by `apply.sh`).
 - **`muse_voice.c`** — a boot melody after `muse_audio_init()`: a synthesized chirp chain, so speaker-chain problems are obvious one second after power-on. Plus a reply-audio level log.
 
-The decode path needs no changes: `decode()` reads the MP3 frame header, sees 24 kHz, and `resampler_init(&s_turn.down, info.hz, MIC_RATE)` handles the 24→16 kHz conversion. Captions follow the played frames automatically.
+The decode path needs no changes: QuickSilver Pro streams MP3 by default (24 kHz mono, 64 kbps), the same container as OpenAI `tts-1`. `decode()` reads the MP3 frame header, sees 24 kHz, and `resampler_init(&s_turn.down, info.hz, MIC_RATE)` handles the 24→16 kHz conversion. Captions follow the played frames automatically.
 
 ## Prerequisites
 
 - **Build host**: Linux or macOS with ESP-IDF **v6.x** for esp32s3. The conventional layout is `~/esp/esp-idf-v6`; set `IDF_PATH` if yours differs. (During install, run `install.sh esp32s3`; if the Python installer stalls, `bash install.sh esp32s3`.)
 - **Hardware**: Seeed SenseCAP Watcher W1-B + a USB-C data cable. It enumerates as a CH342 dual serial: `ttyACM0` is the Himax camera core, **`ttyACM1` is the ESP32-S3** (the one for flashing and the console). On macOS pick the matching `/dev/tty.usbmodem*`.
 - **Muse gadget token**: create a gadget at [gadgets.muse.ai](https://gadgets.muse.ai) (free), copy the `mgst_…` token.
-- **OpenAI API key**: needs `audio/speech` access. `tts-1` is ~$15 per 1M characters — a typical reply is 50–200 chars, so daily use costs fractions of a cent.
+- **TTS API key**: by default, sign up at [quicksilverpro.io](https://quicksilverpro.io) and copy the key from the dashboard. Free trial credit needs no card and includes speech models. Or choose `openai` in `apply.sh` and use an OpenAI key with `audio/speech` access.
+
+## Provider, model and root CA
+
+`apply.sh` prompts `TTS provider [quicksilver/openai]` (default `quicksilver`), then `Reply language [en/zh]` for QuickSilver (default `en`; choose `zh` for Chinese / mixed). OpenAI prompts for model (default `tts-1`) and voice (default `alloy`). The key prompt follows the provider. Re-running the script checks that the patch is already applied and rewrites the configuration; it also asks for the Muse token and CJK caption setting again.
+
+| Provider / choice | Model | Price per 1M characters | Voice field |
+|---|---|---|---|
+| QuickSilver Pro / `en` (default) | `chatterbox-turbo` (English only) | $1.50 — one tenth of OpenAI `tts-1` at $15 (10× cheaper) | Accepts any value, including OpenAI names; recipe sends `alloy` |
+| QuickSilver Pro / `zh` (Chinese, English or mixed) | `qwen3-tts` | $25 — more than OpenAI `tts-1` at $15 | One voice; accepts and ignores the field |
+| QuickSilver Pro / compatibility alias | `tts-1` → `qwen3-tts` | $25, billed as `qwen3-tts` | Same as `qwen3-tts`; unmodified firmware won't select English-only TTS for Chinese |
+| OpenAI (optional) | `tts-1` by default | $15 | Choose at the voice prompt |
+
+Choose `qwen3-tts` for Chinese / mixed replies with one voice; stay on OpenAI if the lower Chinese price or voice choice matters. QuickSilver Pro's input limit is **4,000 characters per request**; this patch keeps the SDK's existing `TEXT_MAX` buffer (1024 bytes per message).
+
+Both endpoints accept the same JSON (`model`, `input`, `voice`, `response_format`) and `Authorization: Bearer <key>`. The patch sets `response_format` to `mp3`.
+
+| Host | Source in this recipe | Embedded filename |
+|---|---|---|
+| `api.quicksilverpro.io` (Let's Encrypt) | `files/isrg-root-x1.pem` — ISRG Root X1, expires 2035-06-04 | `esp32/components/muse/tts_root_ca.pem` |
+| `api.openai.com` (Google Trust Services) | `files/openai_root_ca.pem` — GTS Root R4, valid to 2036 | Same filename |
+
+ISRG Root X1 SHA-256: `96:BC:EC:06:26:49:76:F3:74:60:77:9A:CF:28:C5:A7:CF:E8:A3:C0:AA:E1:1A:8F:FC:EE:05:C0:BD:DF:08:C6`. The QuickSilver host also verifies against ISRG Root X2; this recipe uses X1. **GTS Root R4 will NOT validate QuickSilver Pro.** Changing only the URL causes `No matching trusted root certificate found` → `TTS failed`; re-run `apply.sh` to switch URL, model, key and root together, then rebuild.
+
+Before flashing, check the configured key and TLS from the build host:
+
+```bash
+python3 scripts/tts_probe.py ../muse-gadget-sdk --preflight
+# For qwen3-tts, check a Chinese / mixed sentence too:
+python3 scripts/tts_probe.py ../muse-gadget-sdk --preflight "你好，this is a short test."
+```
+
+This uses API credit and reads the defines and `tts_root_ca.pem` from the SDK; it doesn't need a device or a serial client. It trusts only that root, without the host's default CA store. Expect `TTS ok: N bytes in X ms (first byte Y ms, measured from this host)`. This checks the HTTP response and non-empty audio download; decoding, resampling and speaker output still need the flashed device.
 
 ## Before the first flash: back up the factory NVS
 
@@ -53,7 +85,7 @@ Two non-negotiables:
 - **Use `paced_esptool`, not plain `esptool`.** The CH342 USB bridge drops whole packets at high baud; the paced tool writes at 115200 with inter-chunk pacing. Plain high-baud flashes come out silently corrupt.
 - **Never interrupt a flash.** Half-written partitions are exactly what the NVS backup is for. The last line should be `Hard resetting via RTS pin...` and you'll hear the boot melody.
 
-Changed `TTS_VOICE`/`TTS_MODEL`/the token? Just re-run `build-and-flash.sh` — the incremental build is fast. Changed anything in `SDKCONFIG_DEFAULTS` (e.g. the CJK font)? Delete `build-muse-sensecap-watcher/sdkconfig` first so it regenerates.
+Changed `TTS_VOICE`/`TTS_MODEL`/the token, or switched provider with `apply.sh`? Just re-run `build-and-flash.sh` — the incremental build is fast. Changed anything in `SDKCONFIG_DEFAULTS` (e.g. the CJK font)? Delete `build-muse-sensecap-watcher/sdkconfig` first so it regenerates.
 
 ## Provisioning & pairing
 
@@ -70,7 +102,7 @@ PTT press → mic frames (16 kHz) → hatch upload (STT in the cloud)
   → agent reply arrives on the /chat/subscribe stream as message events
   → text accumulates per message; on message_done the message is TTS_QUEUED
   → start_tts() sets up mp3dec + pcm accounting, silent = false
-  → tts_fetch_openai() POSTs the text, streams MP3 chunks into tts_data()
+  → tts_fetch() POSTs the text, streams MP3 chunks into tts_data()
   → decode() minimp3-decodes, resamples 24k→16k, feeds the speaker stream buffer
   → captions follow the played frames; turn ends when drained
 ```
@@ -79,9 +111,11 @@ Failure modes are graceful: a non-200 or a dropped connection resets the state a
 
 ## Changing voice / model
 
-Edit `TTS_VOICE` / `TTS_MODEL` in `muse_chat_session.cpp`, re-run `build-and-flash.sh` — or set the voice once at `apply.sh` time (it prompts). Voices that read Chinese well: `alloy`, `nova`, `shimmer`, `echo`, `onyx` (see OpenAI's voice list). `gpt-4o-mini-tts` also works and accepts style instructions — wire the prompt in yourself if you want a persona.
+Re-run `apply.sh` to change provider / language / model, then `build-and-flash.sh`. Or edit `TTS_VOICE` / `TTS_MODEL` in `muse_chat_session.cpp` and rebuild: `chatterbox-turbo` accepts any voice value (including OpenAI names), while `qwen3-tts` and its QuickSilver `tts-1` alias ignore the field and use one voice. On OpenAI, the recipe keeps the model / voice prompts; `gpt-4o-mini-tts` also works and accepts style instructions — wire the prompt in yourself if you want a persona.
 
-**Where the latency goes** (measured on a Watcher over 2.4 GHz Wi-Fi): Muse's cloud STT + LLM take ~5–8 s and are outside this recipe's control (swap the agent/backend for real gains); the TTS hop adds ~1–2 s to first sound with streaming enabled — TLS handshake to `api.openai.com` dominates it. Sentence-level TTS (speaking while the LLM is still writing) is a possible future cut, but replies are usually 1–3 sentences and the win is small.
+**QuickSilver first byte** (measured 2026-10-13 from a server, not on-device, for a sentence): `chatterbox-turbo` about **0.8–2 s**; `qwen3-tts` about **1.3–3.4 s**. These measure the TTS request, not the whole push-to-talk turn.
+
+**Where the latency goes** (the original OpenAI recipe, measured on a Watcher over 2.4 GHz Wi-Fi): Muse's cloud STT + LLM take ~5–8 s and are outside this recipe's control (swap the agent/backend for real gains); the TTS hop adds ~1–2 s to first sound with streaming enabled — TLS handshake to `api.openai.com` dominates it. Sentence-level TTS (speaking while the LLM is still writing) is a possible future cut, but replies are usually 1–3 sentences and the win is small.
 
 ## Swapping the brain
 
@@ -91,8 +125,8 @@ Nothing in the TTS path knows which agent produced the text — it fires on `TTS
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `No matching trusted root certificate found` → `TTS failed` | You skipped `apply.sh` (no pinned CA) or applied to a different tree | Re-run `apply.sh`, rebuild |
-| `TTS failed: 0 audio bytes buffered`, no other error | Bad key (401), no route to `api.openai.com`, or the reply text was empty | Check the key; `tts_probe.py` prints the console log |
+| `No matching trusted root certificate found` → `TTS failed` | Missing pinned CA, different SDK tree, or wrong provider's root (GTS Root R4 won't validate QuickSilver) | Re-run `apply.sh` for the chosen provider, rebuild; QuickSilver needs ISRG Root X1 in `tts_root_ca.pem`, OpenAI needs GTS Root R4 |
+| `TTS failed: 0 audio bytes buffered`, no other error | Bad key (401), no route to the chosen TTS host, or the reply text was empty | Check the key with `tts_probe.py <sdk> --preflight`; the serial mode prints the device log |
 | **No sound at all, but captions show** | Speaker off / volume 0 in device settings; or TTS failed silently (see above) | Settings → Speaker on, volume up; watch the console during a turn |
 | `device reports readiness to read but returned no data` | Two processes on `/dev/ttyACM1` (monitor + probe/chat) | One serial client at a time |
 | `turn failed: INTERRUPTED` | The knob was pressed mid-turn (it's the interrupt key) | Hands off the knob while testing |
@@ -101,13 +135,13 @@ Nothing in the TTS path knows which agent produced the text — it fires on `TTS
 | Chinese renders as boxes (□□□) | `CONFIG_MUSE_CJK_FONT` not set — it's opt-in in this recipe (default: Latin glyphs) | Put it in `sdkconfig.token.local`, delete the build's `sdkconfig`, rebuild |
 | `The board didn't take the message` on console | Board asleep or old firmware on the port | Re-plug; check `chat.py --status` |
 
-The console is your friend for all of these: `python3 muse-gadget-sdk/esp32/tools/muse/monitor.py /dev/ttyACM1 30` streams the log. Lines that matter for TTS: `speaking message …`, `TTS ok: N audio bytes buffered`, `reply audio: 24000 Hz, 1 ch, … kbps`.
+The console is your friend for all of these: `python3 muse-gadget-sdk/esp32/tools/muse/monitor.py /dev/ttyACM1 30` streams the log. Lines that matter for TTS: `speaking message …`, `TTS ok: N bytes in X ms`, `reply audio: 24000 Hz, 1 ch, … kbps`.
 
 ## Security
 
-- **Your OpenAI key is compiled into the firmware** (and the Muse token into NVS). On a shelf at home that's fine — the device is not exposed to the internet beyond its own outbound connections. Don't gift or re-sell the device with your keys inside: `write-flash 0x9000 <factory-nvs-backup>` restores the factory partition, and a fresh `idf.py erase-flash` clears the app image.
-- The pinned CA is a public Google Trust Services root (GTS Root R4, self-signed, valid to 2036). Nothing secret in it; it's pinned because the ESP x509 bundle doesn't carry it.
-- The `tts_probe.py` traffic is device → `api.openai.com` over TLS with that pinned root, plus the SDK's own noise-encrypted channel to the Muse hatch.
+- **Your TTS API key is compiled into the firmware** (and the Muse token into NVS). On a shelf at home that's fine — the device is not exposed to the internet beyond its own outbound connections. Don't gift or re-sell the device with your keys inside: `write-flash 0x9000 <factory-nvs-backup>` restores the factory partition, and a fresh `idf.py erase-flash` clears the app image.
+- The pinned CAs are public roots: ISRG Root X1 for QuickSilver Pro (expires 2035-06-04), GTS Root R4 for OpenAI (valid to 2036). Nothing secret in them; `apply.sh` embeds the one matching the host.
+- In `tts_probe.py --preflight`, traffic is build host → the configured TTS endpoint over TLS with the same pinned root as the firmware. In serial mode it's device → that endpoint, plus the SDK's own noise-encrypted channel to the Muse hatch. The probe reads the SDK configuration; rebuild and flash after changes so the board matches it.
 
 ## Hardware notes
 
