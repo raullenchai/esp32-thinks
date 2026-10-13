@@ -21,7 +21,7 @@ The decode path needs no changes: QuickSilver Pro streams MP3 by default (24 kHz
 - **Build host**: Linux or macOS with ESP-IDF **v6.x** for esp32s3. The conventional layout is `~/esp/esp-idf-v6`; set `IDF_PATH` if yours differs. (During install, run `install.sh esp32s3`; if the Python installer stalls, `bash install.sh esp32s3`.)
 - **Hardware**: Seeed SenseCAP Watcher W1-B + a USB-C data cable. It enumerates as a CH342 dual serial: `ttyACM0` is the Himax camera core, **`ttyACM1` is the ESP32-S3** (the one for flashing and the console). On macOS pick the matching `/dev/tty.usbmodem*`.
 - **Muse gadget token**: create a gadget at [gadgets.muse.ai](https://gadgets.muse.ai) (free), copy the `mgst_…` token.
-- **TTS API key**: by default, sign up at [quicksilverpro.io](https://quicksilverpro.io) and copy the key from the dashboard. Free trial credit needs no card and includes speech models. Or choose `openai` in `apply.sh` and use an OpenAI key with `audio/speech` access.
+- **TTS API key**: by default, [sign up](https://quicksilverpro.io/dashboard/?intent=speech&utm_source=github&utm_campaign=esp32-thinks) and copy the key shown at the top of the dashboard. Free trial credit needs no card and includes speech models. Or choose `openai` in `apply.sh` and use an OpenAI key with `audio/speech` access.
 
 ## Provider, model and root CA
 

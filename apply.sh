@@ -40,7 +40,7 @@ esac
 
 # 2) Keys. Read and validate inputs before changing the tree.
 case "$TTS_PROVIDER" in
-    quicksilver) read -r -p "QuickSilver Pro API key (dashboard at https://quicksilverpro.io): " TTS_KEY ;;
+    quicksilver) read -r -p "QuickSilver Pro API key (get one: https://quicksilverpro.io/dashboard/?intent=speech): " TTS_KEY ;;
     openai)
         read -r -p "OpenAI API key (sk-proj-...): " TTS_KEY
         case "$TTS_KEY" in sk-*) ;; *) echo "that doesn't look like an OpenAI key"; exit 1 ;; esac ;;

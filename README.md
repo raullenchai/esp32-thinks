@@ -44,7 +44,7 @@ This recipe wires the hook to QuickSilver Pro TTS by default (OpenAI is an optio
 
 First byte for a sentence, **measured 2026-10-13 from a server, not on the device**: `chatterbox-turbo` about **0.8–2 s**, `qwen3-tts` about **1.3–3.4 s**. Device time also includes Wi-Fi, TLS and the Muse turn; these aren't knob-to-speaker timings. QuickSilver Pro streams MP3 by default (24 kHz mono, 64 kbps), the same container as `tts-1`; the on-device minimp3 + resampler path stays the same.
 
-Get a QuickSilver Pro key at [quicksilverpro.io](https://quicksilverpro.io): sign up, then copy the key from the dashboard. Free trial credit needs no card and includes the speech models. Already have an OpenAI key? Choose `openai` at the provider prompt.
+Get a QuickSilver Pro key: [sign up here](https://quicksilverpro.io/dashboard/?intent=speech&utm_source=github&utm_campaign=esp32-thinks) (Continue with Google is one click), then copy the key shown at the top of the dashboard. The page also gives you a ready-to-paste `curl` that writes `speech.mp3`, so you can hear the voice before flashing. Free trial credit needs no card and includes the speech models. Already have an OpenAI key? Choose `openai` at the provider prompt.
 
 **The root CA must match the host.** QuickSilver Pro uses Let's Encrypt **ISRG Root X1**; OpenAI uses **GTS Root R4**. Keeping the OpenAI root while changing the URL gives `No matching trusted root certificate found` → `TTS failed`. `apply.sh` copies the right root to `tts_root_ca.pem` for you.
 
