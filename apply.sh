@@ -84,8 +84,8 @@ case "$PRESET" in
   *) echo "unknown preset: $PRESET (openai | quicksilver | custom)"; exit 1 ;;
 esac
 
-if [[ "$TTS_URL" != api.openai.com* && "$TTS_CA" == OPENAI_CA ]]; then TTS_CA="ISRG_CA"; fi
-if [[ "$CHAT_URL" != api.openai.com* && "$BRAIN_CA" == OPENAI_CA ]]; then BRAIN_CA="ISRG_CA"; fi
+if [[ "$TTS_URL" != *api.openai.com* && "$TTS_CA" == OPENAI_CA ]]; then TTS_CA="ISRG_CA"; fi
+if [[ "$CHAT_URL" != *api.openai.com* && "$BRAIN_CA" == OPENAI_CA ]]; then BRAIN_CA="ISRG_CA"; fi
 
 # 4) Optional: headless provisioning (skip the BLE phone-setup flow entirely).
 read -r -p "Wi-Fi SSID for headless provisioning [skip]: " DEV_SSID || true
