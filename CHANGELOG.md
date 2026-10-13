@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.1 — 2026-10-13 — wake word: "Hi, ESP"
+
+The gadget now has both ears: **say "Hi, ESP" or press the knob** — both start a turn. Detection is esp-sr WakeNet10 `wn10_hiesp` running on-chip (direct WakeNet, no AFE); on detect it synthesizes a `MUSE_PTT_DOWN` into the same input queue, so recording, VAD end-of-turn and the reply flow are exactly the button's.
+
+- **`model` flash partition** (`partitions_muse.csv`, 0x822000) holds the wake model (`srmodels.bin`); `build-and-flash.sh` flashes it only when `@flash_args` lacks it — appending it by hand makes esptool report a false overlap.
+- **esp-dl kernel fix** — esp-sr's own `compile_req` strips the W8A16 **no-bias** 1×1 conv (`0x0202`) that `wn10_hiesp` needs, so every `detect()` failed with `no Conv kernel for packed key`; `dl-extra-req.yml` re-adds it via esp-dl's multi-component req union.
+- **Why no AFE** — the audio front end's static buffers (~34 KB internal BSS) OOM the codec on this board; `muse_voice.c` feeds idle 20 ms chunks (512-frame aggregation) straight to `create/detect`.
+- **Self-tests** — serial `k` plays the embedded wake phrase and records **in lockstep** (full duplex — a blocking playback would miss its own wake word); `l` runs the mic loopback probe (both channels alive; R is 15–20 dB less sensitive).
+- **Post-turn cooldown** (4 s, armed after `record()` returns — the reply plays inside it) keeps the reply's tail from re-waking the device; `WAKE_VAD_DB` (-45 dBFS) tunes wake-turn end-of-speech.
+- `apply.sh` asks to enable the wake word (default on) and writes `WAKE_WORD`/`WAKE_VAD_DB` into `provider_config.h`. AFE is skipped, so this works on the Watcher's tight internal-heap budget (~7 KB free at boot).
+- Verified on-device: wake detect during the device's own TTS playback → record → STT → brain → spoken reply, end to end. Custom phrases ("Hey Mica") remain a TTS Pipeline V3 exercise (see REFERENCE).
+
 ## v0.2.0 — 2026-10-13 — bring your own brain
 
 The gadget no longer needs the Muse cloud to hold a conversation. **STT + chat + TTS are three independent OpenAI-compatible endpoints** you configure in `provider_config.h` — same provider for all three, or mix and match. Presets: `openai`, `quicksilver`, `custom`.
