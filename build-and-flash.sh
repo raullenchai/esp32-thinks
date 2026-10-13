@@ -25,4 +25,12 @@ echo "== build ok, flashing $PORT (pacing: the CH342 bridge drops bytes at high 
 cd "$B"
 python3 ../tools/muse/paced_esptool.py --chip esp32s3 -p "$PORT" -b 115200 \
     --before default-reset --after hard-reset write-flash "@flash_args"
-echo "flashed. unplug, re-plug (you should hear the boot melody), press the knob and talk."
+# The wake-word model rides in @flash_args (esp-sr adds 0x822000); older SDK
+# revisions don't include it, so flash it separately when missing. Do NOT
+# append it by hand: a duplicate 0x822000 makes esptool report a false overlap.
+if [ -f srmodels/srmodels.bin ] && ! grep -q srmodels flash_args 2>/dev/null; then
+    echo "== flashing wake-word model (0x822000)"
+    python3 ../tools/muse/paced_esptool.py --chip esp32s3 -p "$PORT" -b 115200 \
+        --before default-reset --after hard-reset write-flash 0x822000 srmodels/srmodels.bin
+fi
+echo "flashed. unplug, re-plug (you should hear the boot melody), press the knob and talk -- or say \"Hi ESP\"."
