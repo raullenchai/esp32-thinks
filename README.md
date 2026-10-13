@@ -1,3 +1,5 @@
+<img width="358" height="341" alt="Screenshot 2026-10-12 at 6 21 43 PM" src="https://github.com/user-attachments/assets/ee7031ee-0ad3-4559-ad28-30c26c858a9c" />
+
 # esp32-thinks
 
 **The ESP32 gadget that thinks — and answers out loud.** Push-to-talk in, spoken replies out — a wall-mountable AI voice assistant.
