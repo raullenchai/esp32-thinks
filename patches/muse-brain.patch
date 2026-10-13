@@ -1,0 +1,944 @@
+diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
+index c3e7013..6ee2beb 100644
+--- a/esp32/components/muse/CMakeLists.txt
++++ b/esp32/components/muse/CMakeLists.txt
+@@ -122,6 +122,7 @@ idf_component_register(
+     SRCS ${srcs}
+     INCLUDE_DIRS "."
+     EMBED_FILES ${embed}
++    EMBED_TXTFILES "openai_root_ca.pem" "qs_root_ca.pem"
+     WHOLE_ARCHIVE   # muse_lv_mem.c provides symbols only LVGL references
+     REQUIRES esp_driver_gpio esp_driver_i2c
+     PRIV_REQUIRES ${muse_priv_requires}
+diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
+index a6ad810..691831a 100644
+--- a/esp32/components/muse/muse_chat_session.cpp
++++ b/esp32/components/muse/muse_chat_session.cpp
+@@ -52,6 +52,7 @@
+ #include "esp_attr.h"
+ #include "esp_crt_bundle.h"
+ #include "esp_heap_caps.h"
++#include "esp_http_client.h"
+ #include "esp_log.h"
+ #include "esp_random.h"
+ #include "esp_timer.h"
+@@ -101,6 +102,28 @@ static const char *TAG = "muse_chat_session";
+ #define TEXT_MAX 1024                      /* a message's text, for captions timed to its speech */
+ #define SPEECH_CHARS_PER_S 14              /* until the speech's length is known */
+ #define TEXT_CHARS_PER_S 16                /* speaker off: reading pace, a little over speech */
++
++#include "provider_config.h"
++
++/* Root CA table: map the header's TTS_CA / BRAIN_CA to embedded PEMs. */
++extern const uint8_t openai_root_ca_pem_start[] asm("_binary_openai_root_ca_pem_start");
++extern const uint8_t qs_root_ca_pem_start[] asm("_binary_qs_root_ca_pem_start");
++#define OPENAI_CA openai_root_ca_pem_start
++#define ISRG_CA qs_root_ca_pem_start
++#define BRAIN_SINK_BYTES (96 * 1024)
++
++static uint32_t s_tts_bytes_total;
++static uint8_t *s_brain_note;         /* full WAV staged for the STT upload */
++static size_t s_brain_note_len;
++static uint8_t *s_brain_post;         /* scratch: the multipart body */
++static bool s_brain_sent;             /* the brain turn already emitted the "sent" frame */
++static char *s_brain_hist;            /* rolling transcript memory */
++static int s_brain_hist_n;
++static char *s_http_sink;             /* HTTP response accumulator */
++static size_t s_http_sink_len;
++
++static void brain_voice_reply(void);
++static void brain_text_turn(const char *text);
+ #define TEXT_HOLD_S 2                      /* speaker off: how long a message's last lines stay up */
+ 
+ #define PING_US (20 * 1000000LL)
+@@ -1006,7 +1029,7 @@ static bool turn_start(uint32_t gen, bool text)
+     s_reply_shown[0] = '\0';
+     s_turn.start_us = now_us();
+     resampler_init(&s_turn.up, MIC_RATE, DICT_RATE);
+-    if (!ensure_connected()) {
++    if (!BRAIN_CHAT_URL[0] && !ensure_connected()) {
+         turn_fail(muse_hatch_configured() ? "CAN'T REACH MUSE" : "MUSE NOT SET UP");
+         return false;
+     }
+@@ -1019,6 +1042,13 @@ static void turn_begin(uint32_t gen)
+         return;
+     }
+     if (VOICE_NOTE) {
++        if (s_brain_note) {
++            muse_hatch_wav_header(s_brain_note, MIC_RATE);
++            s_brain_note_len = MUSE_HATCH_WAV_HEADER;
++            s_turn.pcm_bytes = 0;
++            s_turn.phase = P_LISTEN;
++            return;
++        }
+         if (!open_note()) {
+             disconnect("chat open failed");
+             turn_fail("CAN'T REACH MUSE");
+@@ -1131,6 +1161,24 @@ static bool open_note(void)
+ /* Moves the mic into the note request; on release, sends the rest and waits for the reply. */
+ static bool record_note(void)
+ {
++    if (s_brain_note) {
++        size_t room = NOTE_MAX_BYTES + 512 - s_brain_note_len;
++        size_t got = room ? xStreamBufferReceive(s_in, s_brain_note + s_brain_note_len, room, 0) : 0;
++        s_brain_note_len += got;
++        s_turn.pcm_bytes += got;
++        if (s_turn.end_requested || s_turn.pcm_bytes >= NOTE_MAX_BYTES) {
++            mark(M_RELEASE);
++            double secs = (double)s_turn.pcm_bytes / (MIC_RATE * 2);
++            if (secs < 0.3) {
++                turn_fail("DIDN'T CATCH THAT");
++                return true;
++            }
++            s_turn.chat_posted = true;
++            s_turn.chat_us = s_turn.last_event_us = now_us();
++            brain_voice_reply();
++        }
++        return true;
++    }
+     for (;;) {
+         size_t room = NOTE_PART_BYTES - s_turn.note_len;
+         size_t left = NOTE_MAX_BYTES - s_turn.pcm_bytes;
+@@ -1171,6 +1219,10 @@ static bool record_note(void)
+  */
+ static void send_chat(const char *text, const char *modality)
+ {
++    if (BRAIN_CHAT_URL[0]) {
++        brain_text_turn(text);
++        return;
++    }
+     s_turn.chat_posted = true;
+     cJSON *body = cJSON_CreateObject();
+     cJSON_AddStringToObject(body, "message", text);
+@@ -1220,14 +1272,17 @@ static void post_chat(const char *text)
+ /* A typed turn: the text goes straight to the chat. */
+ static void text_begin(const char *text)
+ {
+-    if (!turn_start(0, true)) {
++    if (!turn_start(++s_gen, true)) {
+         return;
+     }
+     ESP_LOGI(TAG, "typed turn: %u bytes", (unsigned)strlen(text));
+     send_chat(text, "text");
+     if (s_turn.phase == P_WAIT_REPLY) {
+         mark(M_SENT);
+-        muse_hatch_console("sent", nullptr, "\"bytes\":%u", (unsigned)strlen(text));
++        if (!s_brain_sent) {
++            muse_hatch_console("sent", nullptr, "\"bytes\":%u", (unsigned)strlen(text));
++        }
++        s_brain_sent = false;
+     }
+ }
+ 
+@@ -1382,6 +1437,17 @@ static void message_done(int i, const char *final_text)
+         if (final_text && final_text[0] && strlen(final_text) != m.len) {
+             n = strlen(final_text);
+             muse_hatch_console("final", final_text, "\"msg\":%d", i);
++            /* Typed turns speak too: the final text is authoritative. */
++            if (s_turn.texts) {
++                strlcpy(s_turn.texts + (&m - s_turn.msgs) * TEXT_MAX, final_text, TEXT_MAX);
++                m.len = n;
++            }
++        }
++        if (!m.len && final_text && final_text[0]) {
++            append_text(m, final_text);
++        }
++        if (m.len && m.tts == TTS_NONE) {
++            m.tts = TTS_QUEUED;
+         }
+         muse_hatch_console("message_done", nullptr, "\"msg\":%d,\"bytes\":%u", i, (unsigned)n);
+         ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)n);
+@@ -1499,6 +1565,547 @@ static void on_chat_ack(stream_t *s)
+     emit(MUSE_HATCH_EV_SENT, nullptr);
+ }
+ 
++/* ---- TTS: speaks gadget replies via OpenAI ---- */
++
++static void tts_data(const uint8_t *data, size_t len);
++
++static void decode(void);
++
++/* Chinese replies get their own TTS model when configured: chatterbox is the
++ * fastest but English-first, qwen3 handles Chinese properly. */
++static const char *tts_model_for(const char *text)
++{
++#ifdef TTS_MODEL_CJK
++    if (TTS_MODEL_CJK[0] && text) {
++        for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
++            if (*p >= 0xE4 && *p <= 0xE9) {   /* CJK unified ideographs */
++                return TTS_MODEL_CJK;
++            }
++        }
++    }
++#endif
++    return TTS_MODEL;
++}
++
++/* Two persistent TLS sessions: one for STT + chat, one for TTS -- a voice
++ * turn speaks sentences while the chat stream is still open, so they cannot
++ * share a connection. A fresh TCP+TLS handshake costs ~1 s here. */
++static esp_http_client_handle_t s_openai_cli;
++static esp_http_client_handle_t s_tts_cli;
++static bool s_tts_overflow;   /* the MP3 buffer overflowed: speech was lost */
++static bool s_tts_first;      /* the next TTS response chunk is the first one */
++
++static esp_err_t openai_http_event(esp_http_client_event_t *evt)
++{
++    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->client &&
++        esp_http_client_get_status_code(evt->client) == 200) {
++        if (evt->user_data) {
++            const uint8_t *d = (const uint8_t *)evt->data;
++            size_t len = evt->data_len;
++            if (s_tts_first) {
++                /* Responses 2+ join a stream that is already mid-decode: drop
++                 * their ID3 tag or minimp3 loses sync. */
++                s_tts_first = false;
++                if (len >= 10 && d[0] == 'I' && d[1] == 'D' && d[2] == '3') {
++                    size_t skip = 10 + (((size_t)(d[6] & 0x7f) << 21) | ((d[7] & 0x7f) << 14) |
++                                        ((d[8] & 0x7f) << 7) | (d[9] & 0x7f));
++                    if (skip >= len) {
++                        return ESP_OK;
++                    }
++                    d += skip;
++                    len -= skip;
++                }
++            }
++            s_tts_bytes_total += len;
++            tts_data(d, len);
++            decode();   /* start speaking as soon as the first frames land */
++            return ESP_OK;
++        }
++        if (s_http_sink && s_http_sink_len < BRAIN_SINK_BYTES - 1) {
++            size_t room = BRAIN_SINK_BYTES - 1 - s_http_sink_len;
++            size_t n = evt->data_len < room ? evt->data_len : room;
++            memcpy(s_http_sink + s_http_sink_len, evt->data, n);
++            s_http_sink_len += n;
++        }
++    }
++    return ESP_OK;
++}
++
++/* POSTs on a kept-alive connection; a failed one is dropped and re-made next call. */
++static bool http_post(esp_http_client_handle_t *cli, void *tag, const char *url, const char *key,
++                      const char *content_type, const char *body, size_t len)
++{
++    if (!*cli) {
++        esp_http_client_config_t cfg = {};
++        cfg.url = url;
++        cfg.method = HTTP_METHOD_POST;
++        cfg.cert_pem = (const char *)(tag ? TTS_CA : BRAIN_CA);
++        cfg.timeout_ms = 30000;
++        cfg.event_handler = openai_http_event;
++        cfg.user_data = tag;
++        *cli = esp_http_client_init(&cfg);
++        if (!*cli) {
++            ESP_LOGE(TAG, "openai: init failed");
++            return false;
++        }
++    }
++    s_http_sink_len = 0;
++    esp_http_client_set_url(*cli, url);
++    char auth[256];
++    snprintf(auth, sizeof(auth), "Bearer %s", key);
++    esp_http_client_set_header(*cli, "Authorization", auth);
++    esp_http_client_set_header(*cli, "Content-Type", content_type);
++    esp_http_client_set_post_field(*cli, body, len);
++    esp_err_t err = esp_http_client_perform(*cli);
++    int status = esp_http_client_get_status_code(*cli);
++    bool ok = err == ESP_OK && status == 200;
++    if (!ok) {
++        ESP_LOGE(TAG, "openai %s: err %s status %d sink %u", url, esp_err_to_name(err), status, (unsigned)s_http_sink_len);
++        esp_http_client_cleanup(*cli);
++        *cli = nullptr;
++    }
++    if (ok && s_http_sink) {
++        s_http_sink[s_http_sink_len] = '\0';
++    }
++    return ok;
++}
++
++static bool openai_perform(const char *url, const char *key, const char *content_type,
++                           const char *body, size_t len, int mode)
++{
++    s_tts_first = mode == 0;
++    return http_post(mode == 0 ? &s_tts_cli : &s_openai_cli, mode == 0 ? (void *)1 : nullptr,
++                     url, key, content_type, body, len);
++}
++
++/* Streams one message MP3 from OpenAI into tts_data(); true on success. */
++static bool tts_fetch_openai(const char *text)
++{
++    static const char *URL = TTS_URL;
++    int64_t t0 = now_us();
++    s_tts_bytes_total = 0;
++
++    cJSON *root = cJSON_CreateObject();
++    if (!root) {
++        return false;
++    }
++    cJSON_AddStringToObject(root, "model", tts_model_for(text));
++    cJSON_AddStringToObject(root, "input", text);
++    if (TTS_VOICE[0]) {
++        cJSON_AddStringToObject(root, "voice", TTS_VOICE);
++    }
++    cJSON_AddStringToObject(root, "response_format", "mp3");
++    char *body = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++    if (!body) {
++        return false;
++    }
++
++    s_tts_overflow = false;
++    bool ok = openai_perform(URL, TTS_API_KEY, "application/json", body, strlen(body), 0);
++    if (ok && s_tts_overflow) {
++        ok = false;   /* speech outran playback: captions are safer than broken audio */
++    }
++    free(body);
++    ESP_LOGI(TAG, "TTS %s: %u bytes in %lld ms", ok ? "ok" : "failed", s_tts_bytes_total, (now_us() - t0) / 1000);
++    return ok;
++}
++
++/* One sentence, spoken while the chat stream is still writing the next one.
++ * Appends to the turn's MP3 buffer without resetting it (sentences share it). */
++static bool tts_fetch_sentence(const char *text, size_t len)
++{
++    char say[1024];
++    size_t j = 0;
++    for (size_t i = 0; i < len && j + 2 < sizeof(say); i++) {
++        char c = text[i];
++        if (c == '*' || c == '#' || c == '`' || c == '_' || c == '\r') {
++            continue;
++        }
++        say[j++] = c;
++    }
++    say[j] = '\0';
++    bool blank = true;
++    for (size_t i = 0; i < j; i++) {
++        if (say[i] != ' ' && say[i] != '\n' && say[i] != '\r' && say[i] != '\t') {
++            blank = false;
++            break;
++        }
++    }
++    if (blank) {
++        return true;
++    }
++    cJSON *root = cJSON_CreateObject();
++    if (!root) {
++        return false;
++    }
++    cJSON_AddStringToObject(root, "model", tts_model_for(say));
++    cJSON_AddStringToObject(root, "input", say);
++    if (TTS_VOICE[0]) {
++        cJSON_AddStringToObject(root, "voice", TTS_VOICE);
++    }
++    cJSON_AddStringToObject(root, "response_format", "mp3");
++    char *body = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++    if (!body) {
++        return false;
++    }
++    s_tts_first = true;
++    bool ok = http_post(&s_tts_cli, (void *)1, TTS_URL, TTS_API_KEY, "application/json", body, strlen(body));
++    free(body);
++    return ok;
++}
++
++/* ---- Brain: bring your own brain (any OpenAI-compatible endpoint) ---- */
++
++#define BRAIN_HIST_MSGS 8             /* user/assistant entries kept in RAM */
++#define BRAIN_HIST_LEN 512
++#define BRAIN_BOUNDARY "esp32thinks7d3a"
++
++static esp_err_t brain_http_event(esp_http_client_event_t *evt)
++{
++    if (evt->event_id == HTTP_EVENT_ON_DATA && s_http_sink &&
++        s_http_sink_len < BRAIN_SINK_BYTES - 1) {
++        size_t room = BRAIN_SINK_BYTES - 1 - s_http_sink_len;
++        size_t n = evt->data_len < room ? evt->data_len : room;
++        memcpy(s_http_sink + s_http_sink_len, evt->data, n);
++        s_http_sink_len += n;
++    }
++    return ESP_OK;
++}
++
++/* One HTTPS POST; the response accumulates in s_http_sink. */
++/* (brain HTTP now goes through openai_perform() above.) */
++
++/* Speech-to-text: multipart-uploads the staged WAV, returns the transcript. */
++/* Trim leading/trailing near-silence from a 16-bit mono WAV in place. The
++ * upload dominates the STT round trip and a PTT note is mostly air at the
++ * edges; keeping 200ms of padding preserves natural speech onsets. */
++static size_t wav_trim_silence(uint8_t *wav, size_t len)
++{
++    const size_t HDR = 44;
++    if (len <= HDR + 2 * 800) {   /* under ~50ms of audio */
++        return len;
++    }
++    int16_t *smp = (int16_t *)(wav + HDR);
++    size_t n = (len - HDR) / 2;
++    const int FLOOR_AMP = 80;   /* mic noise floor measured ~-55 dBFS */
++    const size_t PAD = 3200;    /* 200ms at 16 kHz */
++    size_t a = 0, b = n;
++    while (a < n && smp[a] < FLOOR_AMP && smp[a] > -FLOOR_AMP) {
++        a++;
++    }
++    while (b > a && smp[b - 1] < FLOOR_AMP && smp[b - 1] > -FLOOR_AMP) {
++        b--;
++    }
++    if (b <= a) {   /* all silence: keep the first 200ms so the server still answers */
++        a = 0;
++        b = n < 2 * PAD ? n : 2 * PAD;
++    } else {
++        a = a > PAD ? a - PAD : 0;
++        b = b + PAD < n ? b + PAD : n;
++    }
++    if (a == 0 && b == n) {
++        return len;
++    }
++    memmove(wav + HDR, wav + HDR + 2 * a, 2 * (b - a));
++    return HDR + 2 * (b - a);
++}
++
++static bool brain_stt(const uint8_t *wav, size_t len, char *out, size_t outlen)
++{
++    char head[320];
++    snprintf(head, sizeof(head),
++             "--" BRAIN_BOUNDARY "\r\n"
++             "Content-Disposition: form-data; name=\"model\"\r\n\r\n" BRAIN_STT_MODEL "\r\n"
++             "--" BRAIN_BOUNDARY "\r\n"
++             "Content-Disposition: form-data; name=\"file\"; filename=\"note.wav\"\r\n"
++             "Content-Type: audio/wav\r\n\r\n");
++    static const char tail[] = "\r\n--" BRAIN_BOUNDARY "--\r\n";
++    size_t hlen = strlen(head), tlen = strlen(tail);
++    len = wav_trim_silence((uint8_t *)wav, len);
++    memcpy(s_brain_post, head, hlen);
++    memcpy(s_brain_post + hlen, wav, len);
++    memcpy(s_brain_post + hlen + len, tail, tlen);
++    if (!openai_perform(BRAIN_STT_URL, BRAIN_CHAT_KEY, "multipart/form-data; boundary=" BRAIN_BOUNDARY,
++                    reinterpret_cast<const char *>(s_brain_post), hlen + len + tlen, 1)) {
++        return false;
++    }
++    cJSON *root = cJSON_Parse(s_http_sink);
++    if (!root) {
++        return false;
++    }
++    const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(root, "text"));
++    bool ok = text && text[0];
++    if (ok) {
++        strlcpy(out, text, outlen);
++    }
++    cJSON_Delete(root);
++    return ok;
++}
++
++/* Chat: appends the prompt to the rolling history, asks the model. */
++/* Makes room in the MP3 buffer for the next sentence. */
++static void brain_pump_audio(void)
++{
++    while (s_turn.mp3_len + 8192 > MP3_BUF) {
++        decode();
++        vTaskDelay(pdMS_TO_TICKS(20));
++    }
++}
++
++/* Streams the reply: each finished sentence is spoken while the model is
++ * still writing the rest. Returns the full reply text. */
++static bool brain_chat_stream(const char *prompt, char *reply, size_t replysz)
++{
++    cJSON *body = cJSON_CreateObject();
++    if (!body) {
++        return false;
++    }
++    cJSON_AddStringToObject(body, "model", BRAIN_MODEL);
++    cJSON_AddBoolToObject(body, "stream", true);
++    cJSON *msgs = cJSON_CreateArray();
++    cJSON_AddItemToObject(body, "messages", msgs);
++    cJSON *m = cJSON_CreateObject();
++    cJSON_AddStringToObject(m, "role", "system");
++    cJSON_AddStringToObject(m, "content", BRAIN_SYSTEM);
++    cJSON_AddItemToArray(msgs, m);
++    for (int i = 0; i < s_brain_hist_n; i++) {
++        m = cJSON_CreateObject();
++        cJSON_AddStringToObject(m, "role", (i % 2) ? "assistant" : "user");
++        cJSON_AddStringToObject(m, "content", s_brain_hist + i * BRAIN_HIST_LEN);
++        cJSON_AddItemToArray(msgs, m);
++    }
++    m = cJSON_CreateObject();
++    cJSON_AddStringToObject(m, "role", "user");
++    cJSON_AddStringToObject(m, "content", prompt);
++    cJSON_AddItemToArray(msgs, m);
++#ifdef BRAIN_CHAT_EXTRA
++    if (BRAIN_CHAT_EXTRA[0]) {           /* provider quirks (e.g. no thinking) */
++        cJSON *extra = cJSON_Parse(BRAIN_CHAT_EXTRA);
++        if (extra) {
++            for (cJSON *c = extra->child; c; ) {
++                cJSON *next = c->next;
++                cJSON_AddItemToObject(body, c->string, cJSON_DetachItemViaPointer(extra, c));
++                c = next;
++            }
++            cJSON_Delete(extra);
++        }
++    }
++#endif
++    char *json = cJSON_PrintUnformatted(body);
++    cJSON_Delete(body);
++    if (!json) {
++        return false;
++    }
++
++    if (!s_openai_cli) {
++        esp_http_client_config_t cfg = {};
++        cfg.url = BRAIN_CHAT_URL;
++        cfg.method = HTTP_METHOD_POST;
++        cfg.cert_pem = (const char *)BRAIN_CA;
++        cfg.timeout_ms = 30000;
++        cfg.event_handler = openai_http_event;
++        cfg.user_data = nullptr;
++        s_openai_cli = esp_http_client_init(&cfg);
++        if (!s_openai_cli) {
++            cJSON_free(json);
++            return false;
++        }
++    }
++    s_tts_bytes_total = 0;
++    s_tts_overflow = false;
++    reply[0] = '\0';
++    bool ok = false;
++    size_t blen = strlen(json);
++    if (esp_http_client_set_url(s_openai_cli, BRAIN_CHAT_URL "/chat/completions") == ESP_OK &&
++        esp_http_client_set_method(s_openai_cli, HTTP_METHOD_POST) == ESP_OK) {
++        char auth[256];
++        snprintf(auth, sizeof(auth), "Bearer %s", BRAIN_CHAT_KEY);
++        esp_http_client_set_header(s_openai_cli, "Authorization", auth);
++        esp_http_client_set_header(s_openai_cli, "Content-Type", "application/json");
++        if (esp_http_client_open(s_openai_cli, blen) == ESP_OK &&
++            esp_http_client_write(s_openai_cli, json, blen) == (int)blen &&
++            esp_http_client_fetch_headers(s_openai_cli) >= 0 &&
++            esp_http_client_get_status_code(s_openai_cli) == 200) {
++            ok = true;
++            char chunk[1536], line[1536], pend[1024];
++            size_t llen = 0, plen = 0;
++            bool done = false;
++            for (;;) {
++                int n = esp_http_client_read(s_openai_cli, chunk, sizeof(chunk));
++                if (n <= 0) {
++                    ok = done || reply[0] != '\0';
++                    break;
++                }
++                for (int i = 0; i < n && !done; i++) {
++                    char c = chunk[i];
++                    if (c != '\n') {
++                        if (llen < sizeof(line) - 1) {
++                            line[llen++] = c;
++                        }
++                        continue;
++                    }
++                    line[llen] = '\0';
++                    llen = 0;
++                    if (strncmp(line, "data: ", 6)) {
++                        continue;
++                    }
++                    const char *s = line + 6;
++                    if (!strcmp(s, "[DONE]")) {
++                        done = true;
++                        break;
++                    }
++                    cJSON *e = cJSON_Parse(s);
++                    if (!e) {
++                        continue;
++                    }
++                    cJSON *ch = cJSON_GetArrayItem(cJSON_GetObjectItem(e, "choices"), 0);
++                    const char *delta = ch ? cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(ch, "delta"), "content")) : nullptr;
++                    if (delta && delta[0]) {
++                        strlcat(reply, delta, replysz);
++                        size_t dl = strlen(delta);
++                        if (plen + dl < sizeof(pend) - 1) {
++                            memcpy(pend + plen, delta, dl);
++                            plen += dl;
++                            pend[plen] = '\0';
++                        }
++                        bool brk = plen >= sizeof(pend) - 8;   /* never let it wrap */
++                        if (!brk && plen >= 2) {
++                            unsigned char last = (unsigned char)pend[plen - 1];
++                            brk = last == '.' || last == '!' || last == '?' || last == '\n';
++                            if (!brk && plen >= 3) {
++                                const unsigned char *t = (const unsigned char *)pend + plen - 3;
++                                brk = (t[0] == 0xE3 && t[1] == 0x80 && t[2] == 0x82) ||   /* 。 */
++                                      (t[0] == 0xEF && t[1] == 0xBC && t[2] == 0x81) ||   /* ！ */
++                                      (t[0] == 0xEF && t[1] == 0xBC && t[2] == 0x9F) ||   /* ？ */
++                                      (t[0] == 0xE2 && t[1] == 0x80 && t[2] == 0xA6);     /* … */
++                            }
++                        }
++                        if (brk && plen >= 1) {
++                            brain_pump_audio();
++                            tts_fetch_sentence(pend, plen);
++                            plen = 0;
++                            pend[0] = '\0';
++                        }
++                    }
++                    cJSON_Delete(e);
++                }
++                if (done) {
++                    break;
++                }
++            }
++            if (plen > 0) {
++                brain_pump_audio();
++                tts_fetch_sentence(pend, plen);
++            }
++        } else {
++            ESP_LOGE(TAG, "brain: stream open failed (status %d)", esp_http_client_get_status_code(s_openai_cli));
++        }
++        if (ok) {
++            /* drain the SSE tail so the socket is clean; esp_http_client_open()
++             * reuses a connected client (IDF: connect() skips when state >=
++             * CONNECTED), saving a TCP+TLS handshake every turn */
++            char junk[64];
++            while (esp_http_client_read(s_openai_cli, junk, sizeof(junk)) > 0) {}
++        }
++    }
++    cJSON_free(json);
++    if (!ok) {
++        esp_http_client_cleanup(s_openai_cli);
++        s_openai_cli = nullptr;
++    }
++    return ok;
++}
++
++static void brain_hist_add(const char *user, const char *assistant)
++{
++    if (!s_brain_hist) {
++        return;
++    }
++    if (s_brain_hist_n + 2 > BRAIN_HIST_MSGS) {
++        memmove(s_brain_hist, s_brain_hist + 2 * BRAIN_HIST_LEN, (s_brain_hist_n - 2) * BRAIN_HIST_LEN);
++        s_brain_hist_n -= 2;
++    }
++    strlcpy(s_brain_hist + s_brain_hist_n * BRAIN_HIST_LEN, user, BRAIN_HIST_LEN);
++    strlcpy(s_brain_hist + (s_brain_hist_n + 1) * BRAIN_HIST_LEN, assistant, BRAIN_HIST_LEN);
++    s_brain_hist_n += 2;
++}
++
++/* Injects the reply into the normal turn pipeline: captions, TTS, turn end.
++ * `console`: also emit the @chat frames a typed turn's client waits for, the
++ * "sent" ack first -- the client drops any frames that arrive before it. */
++static void brain_respond(const char *prompt, bool store, bool console)
++{
++    if (s_turn.nmsgs >= MAX_MSGS) {
++        turn_fail("TOO MANY MESSAGES");
++        return;
++    }
++    msg_t &m = s_turn.msgs[s_turn.nmsgs];
++    m = msg_t{};
++    strlcpy(m.id, "brain", sizeof(m.id));
++    /* Reserve the reply slot and TTS state up front, so the sentences that
++     * brain_chat_stream() feeds in start playing before the reply completes. */
++    s_turn.mp3_len = 0;
++    s_turn.mp3_ended = false;
++    s_turn.kbps = 0;
++    s_turn.down_rate = 0;
++    mp3dec_init(&s_turn.dec);
++    m.pcm_start = s_turn.pcm_out;
++    m.pcm_frames = 0;
++    m.tts = TTS_ACTIVE;
++    s_turn.tts_msg = s_turn.nmsgs;
++    s_turn.silent = false;
++    char reply[2048];
++    if (!brain_chat_stream(prompt, reply, sizeof(reply))) {
++        turn_fail("BRAIN UNREACHABLE");
++        return;
++    }
++    if (store) {
++        brain_hist_add(prompt, reply);
++    }
++    if (strlen(reply) >= TEXT_MAX) {
++        reply[TEXT_MAX - 1] = '\0';
++    }
++    append_text(m, reply);
++    m.done = true;
++    if (!s_turn.mp3_len) {
++        /* nothing was spoken: let start_tts() fetch the whole reply instead */
++        m.tts = TTS_QUEUED;
++        s_turn.tts_msg = -1;
++    } else {
++        s_turn.mp3_ended = true;   /* all sentences fetched: decode() drains, then finishes */
++        show_reply_start(m);
++    }
++    s_turn.nmsgs++;
++    if (console) {
++        s_brain_sent = true;
++        muse_hatch_console("sent", nullptr, "\"bytes\":%u", (unsigned)strlen(prompt));
++        muse_hatch_console("final", reply, "\"msg\":0");
++        muse_hatch_console("message_done", nullptr, "\"msg\":0,\"bytes\":%u", (unsigned)m.len);
++    }
++    ESP_LOGI(TAG, "brain reply: %u chars, %u audio bytes", (unsigned)m.len, (unsigned)s_turn.mp3_len);
++    s_turn.phase = P_WAIT_REPLY;
++}
++
++static void brain_voice_reply(void)
++{
++    char heard[1024];
++    if (!brain_stt(s_brain_note, s_brain_note_len, heard, sizeof(heard))) {
++        turn_fail("BRAIN STT FAILED");
++        return;
++    }
++    ESP_LOGI(TAG, "brain heard: %s", heard);
++    brain_respond(heard, true, false);
++}
++
++static void brain_text_turn(const char *text)
++{
++    s_turn.chat_posted = true;
++    s_turn.chat_us = s_turn.last_event_us = now_us();
++    brain_respond(text, true, s_turn.text);
++}
++
+ /* ---- Turn: speech ---- */
+ 
+ static void start_tts(void)
+@@ -1526,6 +2133,34 @@ static void start_tts(void)
+          * end. decode() plays it at the speaker's volume, captions following,
+          * and finishes the message once it's drained.
+          */
++        const char *text = s_turn.texts ? s_turn.texts + i * TEXT_MAX : NULL;
++        if (text && text[0]) {
++            m.pcm_start = s_turn.pcm_out;
++            m.pcm_frames = 0;
++            m.tts = TTS_ACTIVE;
++            s_turn.tts_msg = i;
++            s_turn.silent = false;
++            s_turn.mp3_len = 0;
++            s_turn.mp3_ended = false;
++            s_turn.kbps = 0;
++            s_turn.down_rate = 0;
++            mp3dec_init(&s_turn.dec);
++            ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
++            show_reply_start(m);
++            if (tts_fetch_openai(text)) {
++                s_turn.mp3_ended = true;
++            } else {
++                s_turn.mp3_len = 0;
++                s_turn.mp3_ended = false;
++                s_turn.kbps = 0;
++                s_turn.down_rate = 0;
++                mp3dec_init(&s_turn.dec);
++                m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
++                s_turn.silent = true;
++                ESP_LOGW(TAG, "TTS failed, falling back to captions");
++            }
++            return;
++        }
+         m.pcm_start = s_turn.pcm_out;
+         m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+         m.tts = TTS_ACTIVE;
+@@ -1540,6 +2175,7 @@ static void start_tts(void)
+ static void tts_data(const uint8_t *data, size_t len)
+ {
+     if (s_turn.mp3_len + len > MP3_BUF) {
++        s_tts_overflow = true;
+         ESP_LOGW(TAG, "MP3 buffer full, dropping %u bytes", (unsigned)len);
+         len = MP3_BUF - s_turn.mp3_len;
+     }
+@@ -1880,7 +2516,7 @@ static void drop_connection(const char *why)
+     bool in_turn = s_turn.phase != P_IDLE;
+     disconnect(why);
+     s_auto_next_us = now_us() + s_auto_backoff_us;
+-    if (in_turn) {
++    if (in_turn && !(BRAIN_CHAT_URL[0] && (s_brain_note || s_turn.text))) {
+         turn_fail("LOST CONNECTION TO MUSE");
+     }
+     muse_hatch_report(MUSE_HATCH_UNTESTED, "");
+@@ -1954,7 +2590,10 @@ static void hatch_task(void *arg)
+                 handle(cmd);
+             }
+         }
+-        if (!s_connected) {
++        /* A brain turn runs on its own HTTPS calls; the hatch socket is
++         * irrelevant to it, so keep the turn moving while disconnected. */
++        bool brain_turn = BRAIN_CHAT_URL[0] && s_turn.phase != P_IDLE;
++        if (!s_connected && !brain_turn) {
+             if (!muse_wifi_connected()) {
+                 s_auto_next_us = 0;
+                 s_auto_backoff_us = AUTO_RETRY_MIN_US;
+@@ -1972,16 +2611,16 @@ static void hatch_task(void *arg)
+         }
+ 
+         /* Resting, Wi-Fi may nap; don't wait for the server to go quiet. */
+-        if (s_resting && !muse_wifi_connected()) {
++        if (s_connected && s_resting && !muse_wifi_connected()) {
+             drop_connection("Wi-Fi down");
+             continue;
+         }
+-        if (!poll_socket()) {
++        if (s_connected && !poll_socket()) {
+             drop_connection("receive failed");
+             continue;
+         }
+         bool sent = true;
+-        if (s_turn.phase == P_LISTEN) {
++        if (s_turn.phase == P_LISTEN && (s_connected || brain_turn)) {
+             sent = VOICE_NOTE ? record_note() : pump_mic();
+         }
+         if (!sent) {
+@@ -1990,24 +2629,33 @@ static void hatch_task(void *arg)
+         }
+         if (s_turn.phase == P_WAIT_REPLY) {
+             start_tts();
++            if (s_turn.text) {
++                /* Typed turns have no on-device playback loop: keep s_out
++                 * empty so the MP3 keeps decoding and the turn can end. */
++                int16_t junk[512];
++                while (xStreamBufferReceive(s_out, junk, sizeof(junk), 0)) {
++                }
++            }
+             decode();
+         }
+-        if (!s_connected) {
++        if (!s_connected && !brain_turn) {
+             continue;
+         }
+         check_turn();
+ 
+-        int64_t t = now_us();
+-        if (t - s_conn.last_rx_us > DEAD_US) {
+-            drop_connection("server went quiet");
+-        } else if (s_turn.phase == P_IDLE && t - s_conn.last_use_us > IDLE_CLOSE_US) {
+-            disconnect("idle");
+-            muse_hatch_report(MUSE_HATCH_UNTESTED, "");
+-            s_auto_next_us = INT64_MAX;   /* the next turn connects */
+-        } else if (t - s_conn.last_ping_us > PING_US) {
+-            s_conn.last_ping_us = t;
+-            if (!ws_send_ping(s_conn.tls)) {
+-                drop_connection("ping failed");
++        if (s_connected) {
++            int64_t t = now_us();
++            if (t - s_conn.last_rx_us > DEAD_US) {
++                drop_connection("server went quiet");
++            } else if (s_turn.phase == P_IDLE && t - s_conn.last_use_us > IDLE_CLOSE_US) {
++                disconnect("idle");
++                muse_hatch_report(MUSE_HATCH_UNTESTED, "");
++                s_auto_next_us = INT64_MAX;   /* the next turn connects */
++            } else if (t - s_conn.last_ping_us > PING_US) {
++                s_conn.last_ping_us = t;
++                if (!ws_send_ping(s_conn.tls)) {
++                    drop_connection("ping failed");
++                }
+             }
+         }
+     }
+@@ -2054,6 +2702,14 @@ extern "C" void muse_hatch_start(void)
+     s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
+     s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
+     s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;
++    if (BRAIN_CHAT_URL[0]) {
++        if (VOICE_NOTE) {
++            s_brain_note = static_cast<uint8_t *>(psram_alloc(NOTE_MAX_BYTES + 1024));
++            s_brain_post = static_cast<uint8_t *>(psram_alloc(NOTE_MAX_BYTES + 2048));
++        }
++        s_brain_hist = static_cast<char *>(psram_alloc(BRAIN_HIST_MSGS * BRAIN_HIST_LEN));
++        s_http_sink = static_cast<char *>(psram_alloc(BRAIN_SINK_BYTES));
++    }
+     s_turn.texts = static_cast<char *>(psram_alloc(MAX_MSGS * TEXT_MAX));   /* captions just stay untimed without it */
+     s_pcm = static_cast<int16_t *>(psram_alloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)));
+     s_pcm16 = static_cast<int16_t *>(psram_alloc((MINIMP3_MAX_SAMPLES_PER_FRAME + 8) * sizeof(int16_t)));
+@@ -2064,6 +2720,7 @@ extern "C" void muse_hatch_start(void)
+     s_turn.tts_msg = -1;
+     /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here. */
+     if (!s_cmds || !s_events || !s_in || !s_out || !s_turn.chunk || !s_turn.mp3 || (VOICE_NOTE && !s_turn.note) || !s_pcm || !s_pcm16 ||
++        (BRAIN_CHAT_URL[0] && (!s_http_sink || !s_brain_hist || (VOICE_NOTE && (!s_brain_note || !s_brain_post)))) ||
+         xTaskCreatePinnedToCoreWithCaps(hatch_task, "muse_chat", 48 * 1024, nullptr, 5, nullptr, 0,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+         ESP_LOGE(TAG, "start failed");
+diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
+index 35a7ff4..b02be07 100644
+--- a/esp32/components/muse/muse_voice.c
++++ b/esp32/components/muse/muse_voice.c
+@@ -30,6 +30,10 @@
+ 
+ #include "muse_adpcm.h"
+ #include "muse_audio.h"
++#include "muse_link.h"
++#include "muse_settings.h"
++#include "muse_wifi.h"
++#include "provider_config.h"
+ #include "muse_board.h"
+ #include "muse_chat.h"
+ #include "muse_input.h"
+@@ -37,8 +41,10 @@
+ #include "muse_settings.h"
+ #include "muse_state.h"
+ #include "muse_wifi.h"
++#include "provider_config.h"
+ 
+ static const char *TAG = "muse_voice";
++static float s_reply_max_lvl;
+ 
+ #define MAX_SECS 15
+ #define TAIL_FRAMES (MUSE_AUDIO_RATE * 12 / 100)   /* capture lag + poll interval, stops before the release click */
+@@ -401,10 +407,15 @@ static bool hatch_reply(bool *delivered)
+         if (n) {
+             if (!speaking) {
+                 speaking = true;
++                s_reply_max_lvl = 0.0f;
+                 muse_state_set_mode(MUSE_MODE_SPEAKING);
+                 ESP_LOGI(TAG, "reply audio after %.2fs", (esp_timer_get_time() - t0) / 1e6);
+             }
+-            muse_state_set_level(muse_audio_level(buf, n));
++            {
++                float lvl = muse_audio_level(buf, n);
++                if (lvl > s_reply_max_lvl) s_reply_max_lvl = lvl;
++                muse_state_set_level(lvl);
++            }
+             muse_audio_write(buf, n);
+             played += n;
+         } else if (done) {
+@@ -420,8 +431,8 @@ static bool hatch_reply(bool *delivered)
+         }
+     }
+     muse_state_set_level(0);
+-    ESP_LOGI(TAG, "muse reply: %.2fs of audio, %.2fs total", (double)played / MUSE_AUDIO_RATE,
+-             (esp_timer_get_time() - t0) / 1e6);
++    ESP_LOGI(TAG, "muse reply: %.2fs of audio, %.2fs total, max lvl %.3f", (double)played / MUSE_AUDIO_RATE,
++             (esp_timer_get_time() - t0) / 1e6, (double)s_reply_max_lvl);
+     if (!played) {
+         /* No speech (TTS unavailable): leave the reply text up for a moment. */
+         vTaskDelay(pdMS_TO_TICKS(2500));
+@@ -887,6 +898,26 @@ static void voice_task(void *arg)
+     }
+ }
+ 
++/* Headless dev provisioning: a board flashed with DEV_WIFI_SSID writes its
++ * credentials and a placeholder token on boot, so the brain works without the
++ * BLE phone-setup flow. Empty DEV_WIFI_SSID disables it. */
++static void dev_provision_task(void *arg)
++{
++    vTaskDelay(pdMS_TO_TICKS(5000));
++    char ssid[MUSE_SSID_MAX + 1] = {0}, pass[MUSE_PASS_MAX + 1] = {0};
++    muse_link_wifi_get(ssid, pass);
++    if (!ssid[0] && DEV_WIFI_SSID[0]) {
++        muse_link_wifi_set(DEV_WIFI_SSID, DEV_WIFI_PASS);
++        muse_wifi_apply();
++        ESP_LOGI(TAG, "dev provision: wifi %s", DEV_WIFI_SSID);
++    }
++    if (muse_settings_hatch_token_len() == 0 && DEV_WIFI_SSID[0]) {
++        muse_settings_set_hatch_token("brain-local", false);
++        ESP_LOGI(TAG, "dev provision: placeholder token (brain mode)");
++    }
++    vTaskDelete(NULL);
++}
++
+ esp_err_t muse_voice_start(QueueHandle_t queue)
+ {
+     s_queue = queue;
+@@ -901,6 +932,11 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
+                                         MUSE_BIG_CAPS) != pdPASS) {
+         return ESP_ERR_NO_MEM;
+     }
++#if defined(DEV_WIFI_SSID)
++    if (DEV_WIFI_SSID[0]) {
++        xTaskCreate(dev_provision_task, "devprov", 4096, NULL, 5, NULL);
++    }
++#endif
+     return ESP_OK;
+ }
+ 

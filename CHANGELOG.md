@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.0 — 2026-10-13 — bring your own brain
+
+The gadget no longer needs the Muse cloud to hold a conversation. **STT + chat + TTS are three independent OpenAI-compatible endpoints** you configure in `provider_config.h` — same provider for all three, or mix and match. Presets: `openai`, `quicksilver`, `custom`.
+
+- **Device-side brain** — voice notes are transcribed server-side, answered by the chat model you pick, and spoken via the speech endpoint. The Muse cloud agent still works as a fallback (its token is now optional).
+- **Streaming sentence TTS** — the chat SSE stream is parsed at sentence boundaries (ASCII + CJK); each sentence is synthesized while the model writes the next one, into the audio buffer already playing. A reserved message slot keeps captions in sync mid-stream.
+- **TLS keep-alive** — two persistent sessions (one for transcription+chat, one for speech, which must stay open while the chat stream is live). Warm turns skip the ~1.5 s handshake; a failed request drops only its own connection.
+- **Language-aware voice** — `TTS_MODEL_CJK` picks a different speech model for Chinese turns (QuickSilver: chatterbox-turbo for English speed, qwen3-tts for Chinese quality).
+- **Headless provisioning** — set `DEV_WIFI_SSID`/`DEV_WIFI_PASS` and the board self-provisions on boot (credentials + a placeholder token), no BLE phone flow required. The gadget works with **no Muse account at all**.
+- **Faster STT** — recordings are trimmed to speech before upload (the PTT note is mostly air at the edges); warm transcription ≈ 3.4 s on device.
+- **Fixes**: 1-character replies ("4") now get speech; whitespace-only sentences skip the speech round trip; `\r` is stripped from TTS input; a dropped connection no longer fails an in-flight brain turn; long replies on typed turns no longer stall the decoder (the console path now drains the audio buffer like voice turns do).
+- `apply.sh` now generates `provider_config.h` (presets or fully custom) and asks for keys per endpoint; the Muse token and the boot melody are optional. `patches/muse-brain.patch` replaces `muse-tts.patch` (it includes the v0.1 TTS hook).
+- Latency receipts (warm, QuickSilver preset, measured on device): transcription 3.4 s, first spoken word ≈ 5–7 s after release; the text caption shows at ~2–3 s.
+
 ## v0.1.1 — 2026-10-12
 
 - **Stream the TTS audio while downloading** — `decode()` now runs from the HTTP event handler, so the device starts speaking as soon as the first MP3 frames land instead of after the full download (~1–2 s earlier first sound on Wi-Fi).
