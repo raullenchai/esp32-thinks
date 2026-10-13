@@ -62,7 +62,8 @@ case "$PRESET" in
     STT_MODEL="whisper-large-v3-turbo"
     CHAT_URL="https://api.quicksilverpro.io/v1"
     CHAT_MODEL="deepseek-v4.1-flash"
-    CHAT_EXTRA="{\"reasoning\":{\"exclude\":true}}"   # skip its thinking phase
+    # escaped for embedding in the C string: {"reasoning":{"exclude":true}}
+    CHAT_EXTRA='{\"reasoning\":{\"exclude\":true}}'   # skip its thinking phase
     TTS_CA="ISRG_CA"; BRAIN_CA="ISRG_CA"
     read -r -p "QuickSilver API key: " KEY
     TTS_KEY="$KEY"; CHAT_KEY="$KEY"
