@@ -39,6 +39,8 @@ TTS_MODEL_CJK=""              # optional second voice model for Chinese turns
 TTS_KEY=""
 STT_URL="https://api.openai.com/v1/audio/transcriptions"
 STT_MODEL="whisper-1"
+STT_LANG="zh"                                   # pin Whisper's language ("auto" = let it guess)
+STT_PROMPT="以下是普通话的句子。"                    # prompt nudge in that language
 CHAT_URL="https://api.openai.com/v1"
 CHAT_KEY=""
 CHAT_MODEL="gpt-4o-mini"
@@ -139,6 +141,10 @@ cat > esp32/components/muse/provider_config.h <<EOF
 /* --- Transcription (voice note -> text) --- */
 #define BRAIN_STT_URL   "$STT_URL"
 #define BRAIN_STT_MODEL "$STT_MODEL"
+/* Whisper hallucinates a language on short notes; pin it (ISO 639-1) and
+ * nudge it with a prompt in that language. "auto" sends neither field. */
+#define BRAIN_STT_LANG   "$STT_LANG"
+#define BRAIN_STT_PROMPT "$STT_PROMPT"
 
 /* --- Chat (text -> reply text) --- */
 #define BRAIN_CHAT_URL  "$CHAT_URL"
