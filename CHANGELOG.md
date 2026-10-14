@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.5 — 2026-10-14 — recover quickly from peripheral stalls
+
+Outstanding audio or LCD work now triggers the zero-allocation coroner after **20 s**, then reboots after the 3 s log-drain interval. Idle time and cloud response time do not count as peripheral stalls. This is a reboot recovery path; the underlying DMA/SPI fault remains unresolved.
+
+- **Independent I/O deadlines** — monitor codec RX/TX, codec power changes, LCD flush completion and queued LCD commands. Cover boot/loopback audio reads as well as normal capture. Repeated driver errors retain the first failure's age until a successful operation or intentional audio power-down.
+- **Keep evidence and the long backstop** — retain the existing task dump and 360 s voice-loop recovery. Fix the 300 s diagnostic dump resetting the stall clock, which could prevent that backstop from ever firing. Poll the coroner once per second and log health once per minute.
+- **Avoid unsafe teardown** — IDF's SPI panel deletion waits indefinitely for outstanding transactions; I2S disable waits for the active read to release its semaphore. Resetting the panel alone cannot release these software waits. No force deletion of tasks or DMA-owned buffers.
+- **Validation** — two spontaneous stalls rebooted in about **24.2 s and 24.0 s**. After the second restart, `>tasks` and the complete `k` voice path passed (2.8 s voice turn). Forced-battery sleep for 75 s caused no false reset. Watcher/AIPI builds and 248 host tests checked; final patch applies through `apply.sh`. The fault can recur soon after restart: [receipts and limitations](docs/STABILITY-v0.2.5.md).
+
 ## v0.2.4 — 2026-10-14 — faster voice turns, correct HTTP reuse
 
 The Watcher now answers in **about 3.4 s after recording ends**, including the first turn after a fresh boot with connection preparation enabled. Typed turns finish in **2.2–2.6 s** (first after boot: **2.5 s**), down from the previous 5.1–5.6 s. [Measurements and conditions](docs/LATENCY-v0.2.4.md).

@@ -32,6 +32,7 @@ esp32-thinks flips that. The device runs **your** stack: pick the cheapest trans
 - **Bring your own brain** — three independent OpenAI-compatible endpoints (STT / chat / TTS) in one config file. Mix providers freely; presets: `openai`, `quicksilver`, `custom`.
 - **Streaming voice replies** — the chat stream is parsed at sentence boundaries (ASCII + CJK); each sentence is synthesized the moment it lands and appended to the audio already playing. First word arrives while the model is still generating.
 - **Faster answers** — voice reply starts **≈ 3.4 s after recording**, typed turns finish **2.2–2.6 s**. Connections prepare after Wi-Fi is ready; [v0.2.4 receipts](docs/LATENCY-v0.2.4.md) include first-after-boot and warm samples.
+- **Automatic stall recovery** — outstanding I2S or LCD work gets a 20 s deadline, followed by the existing task dump and reboot. Normal sleep and cloud response time do not use that deadline. [Stability checks](docs/STABILITY-v0.2.5.md).
 - **Language-aware voice** — Chinese turns can use a different (better) TTS model than English ones, picked automatically from the transcript.
 - **Headless provisioning** — put your Wi-Fi in the config; the device self-provisions on boot. No app, no BLE dance, no vendor account needed.
 - **Silence-trimmed uploads** — recordings are trimmed to speech before upload, shaving ~0.5 s off transcription.

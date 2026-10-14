@@ -1,8 +1,16 @@
 diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
-index c3e7013..0d383df 100644
+index c3e7013..1803a20 100644
 --- a/esp32/components/muse/CMakeLists.txt
 +++ b/esp32/components/muse/CMakeLists.txt
-@@ -43,7 +43,7 @@ if(CONFIG_MUSE_ENABLED)
+@@ -30,6 +30,7 @@ if(CONFIG_MUSE_ENABLED)
+         "muse_battery.c"
+         "muse_ui.c"
+         "muse_audio.c"
++        "muse_io_watch.c"
+         "muse_pmu.c"
+         "muse_input.c"
+         "muse_menu.c"
+@@ -43,7 +44,7 @@ if(CONFIG_MUSE_ENABLED)
          "muse_link.c"
          "muse_ble.c")
      if(CONFIG_MUSE_HATCH)
@@ -11,7 +19,7 @@ index c3e7013..0d383df 100644
          list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
      else()
          list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
-@@ -106,22 +106,26 @@ if(CONFIG_MUSE_ENABLED)
+@@ -106,22 +107,26 @@ if(CONFIG_MUSE_ENABLED)
  elseif(CONFIG_HOMEHUB_VOICE)
      # The Voice PE board uses just the Hatch voice session; the project's main/
      # voice_muse_chat.c stands in for the Muse settings, Wi-Fi and Link hooks.
@@ -42,7 +50,7 @@ index c3e7013..0d383df 100644
      WHOLE_ARCHIVE   # muse_lv_mem.c provides symbols only LVGL references
      REQUIRES esp_driver_gpio esp_driver_i2c
      PRIV_REQUIRES ${muse_priv_requires}
-@@ -136,3 +140,12 @@ if(CONFIG_MUSE_ENABLED)
+@@ -136,3 +141,12 @@ if(CONFIG_MUSE_ENABLED)
          "LV_ASSERT_HANDLER_INCLUDE=<stdlib.h>"
          "LV_ASSERT_HANDLER=abort()\;")
  endif()
@@ -55,6 +63,52 @@ index c3e7013..0d383df 100644
 +    include(${_muse_dl_dir}/cmake/compile_register.cmake)
 +    esp_dl_compile_add_yml(${CMAKE_CURRENT_LIST_DIR}/dl-extra-req.yml)
 +endif()
+diff --git a/esp32/components/muse/boards/muse_lcd_bands.c b/esp32/components/muse/boards/muse_lcd_bands.c
+index e7d0ef0..e31a942 100644
+--- a/esp32/components/muse/boards/muse_lcd_bands.c
++++ b/esp32/components/muse/boards/muse_lcd_bands.c
+@@ -28,6 +28,7 @@
+ #include "freertos/task.h"
+ 
+ #include "muse_mem.h"
++#include "muse_io_watch.h"
+ 
+ typedef struct {
+     const uint8_t *data;   /* NULL: run s_call instead */
+@@ -54,6 +55,9 @@ static bool IRAM_ATTR chunk_done(void)
+ {
+     portENTER_CRITICAL_SAFE(&s_lock);
+     bool last = s_chunks_out > 0 && --s_chunks_out == 0;
++    if (last) {
++        muse_io_watch_end(MUSE_IO_LCD_FLUSH, true);
++    }
+     portEXIT_CRITICAL_SAFE(&s_lock);
+     return last;
+ }
+@@ -76,7 +80,12 @@ static esp_err_t queue_band(lv_display_t *disp, esp_lcd_panel_handle_t panel, in
+     (void)panel;
+     (void)ctx;
+     band_t b = { data, x1, y1, x2, y2 };
+-    return xQueueSend(s_bands, &b, 0) == pdTRUE ? ESP_OK : ESP_FAIL;
++    muse_io_watch_begin(MUSE_IO_LCD_FLUSH);
++    if (xQueueSend(s_bands, &b, 0) == pdTRUE) {
++        return ESP_OK;
++    }
++    muse_io_watch_end(MUSE_IO_LCD_FLUSH, true);
++    return ESP_FAIL;
+ }
+ 
+ /*
+@@ -161,7 +170,9 @@ void muse_lcd_bands_run(void (*fn)(void *arg), void *arg)
+     s_call = fn;
+     s_call_arg = arg;
+     const band_t call = { 0 };
++    muse_io_watch_begin(MUSE_IO_LCD_CALL);
+     xQueueSend(s_bands, &call, portMAX_DELAY);
+     xSemaphoreTake(s_call_done, portMAX_DELAY);
++    muse_io_watch_end(MUSE_IO_LCD_CALL, true);
+     xSemaphoreGive(s_call_lock);
+ }
 diff --git a/esp32/components/muse/dl-extra-req.yml b/esp32/components/muse/dl-extra-req.yml
 new file mode 100644
 index 0000000..14ef13f
@@ -81,6 +135,122 @@ index d5cfdec..5a25ddc 100644
    espressif/cjson: "~1.7"
    lvgl/lvgl:
      version: "9.5.0"
+diff --git a/esp32/components/muse/muse_audio.c b/esp32/components/muse/muse_audio.c
+index 9602928..ded021c 100644
+--- a/esp32/components/muse/muse_audio.c
++++ b/esp32/components/muse/muse_audio.c
+@@ -28,6 +28,7 @@
+ 
+ #include "muse_board.h"
+ #include "muse_mem.h"
++#include "muse_io_watch.h"
+ #include "muse_settings.h"
+ 
+ static const char *TAG = "muse_audio";
+@@ -41,6 +42,23 @@ static bool s_open;
+ static int16_t s_in_stereo[MUSE_AUDIO_CHUNK * CHANNELS];
+ static int16_t s_out_stereo[MUSE_AUDIO_CHUNK * CHANNELS];
+ 
++/* Keep the watchdog independent of the task stuck inside the driver. */
++static int codec_read(void *data, int bytes)
++{
++    muse_io_watch_begin(MUSE_IO_RX);
++    int ret = esp_codec_dev_read(s_mic, data, bytes);
++    muse_io_watch_end(MUSE_IO_RX, ret == ESP_CODEC_DEV_OK);
++    return ret;
++}
++
++static int codec_write(void *data, int bytes)
++{
++    muse_io_watch_begin(MUSE_IO_TX);
++    int ret = esp_codec_dev_write(s_spk, data, bytes);
++    muse_io_watch_end(MUSE_IO_TX, ret == ESP_CODEC_DEV_OK);
++    return ret;
++}
++
+ /* One-pole high-pass on the mixed mic signal. */
+ static float s_hpf_a;
+ static float s_hpf_x1, s_hpf_y1;
+@@ -84,6 +102,7 @@ void muse_audio_power(bool on)
+     if (!s_spk || on == s_open) {
+         return;
+     }
++    muse_io_watch_begin(MUSE_IO_AUDIO_POWER);
+     /* The shared I2S bus gets disabled twice (once per codec), which logs a
+      * harmless error. */
+     esp_log_level_t lvl = esp_log_level_get("i2s_common");
+@@ -105,8 +124,12 @@ void muse_audio_power(bool on)
+         esp_codec_dev_close(s_spk);
+         esp_codec_dev_close(s_mic);
+         s_open = false;
++        /* Intentional power-down is healthy inactivity. */
++        muse_io_watch_end(MUSE_IO_RX, true);
++        muse_io_watch_end(MUSE_IO_TX, true);
+     }
+     esp_log_level_set("i2s_common", lvl);
++    muse_io_watch_end(MUSE_IO_AUDIO_POWER, on == s_open);
+ }
+ 
+ void muse_audio_set_volume(int volume)
+@@ -139,13 +162,13 @@ void muse_audio_selftest(void)
+ 
+     /* Capture: drop the DMA backlog, then time a known number of frames. */
+     for (int n = 0; n < FLUSH; n += MUSE_AUDIO_CHUNK) {
+-        esp_codec_dev_read(s_mic, s_in_stereo, sizeof(s_in_stereo));
++        codec_read(s_in_stereo, sizeof(s_in_stereo));
+     }
+     double sl = 0, sr = 0, slr = 0, ml = 0, mr = 0;
+     int pl = 0, pr = 0;
+     int64_t t0 = esp_timer_get_time();
+     for (int n = 0; n < MEASURE; n += MUSE_AUDIO_CHUNK) {
+-        esp_codec_dev_read(s_mic, s_in_stereo, sizeof(s_in_stereo));
++        codec_read(s_in_stereo, sizeof(s_in_stereo));
+         for (int i = 0; i < MUSE_AUDIO_CHUNK; i++) {
+             int l = s_in_stereo[2 * i], r = s_in_stereo[2 * i + 1];
+             ml += l;
+@@ -166,11 +189,11 @@ void muse_audio_selftest(void)
+     /* Playback: fill the DMA queue with silence, then time more silence. */
+     memset(s_out_stereo, 0, sizeof(s_out_stereo));
+     for (int n = 0; n < FLUSH; n += MUSE_AUDIO_CHUNK) {
+-        esp_codec_dev_write(s_spk, s_out_stereo, sizeof(s_out_stereo));
++        codec_write(s_out_stereo, sizeof(s_out_stereo));
+     }
+     t0 = esp_timer_get_time();
+     for (int n = 0; n < MEASURE; n += MUSE_AUDIO_CHUNK) {
+-        esp_codec_dev_write(s_spk, s_out_stereo, sizeof(s_out_stereo));
++        codec_write(s_out_stereo, sizeof(s_out_stereo));
+     }
+     float play_hz = MEASURE * 1e6f / (float)(esp_timer_get_time() - t0);
+ 
+@@ -228,8 +251,8 @@ void muse_audio_loopback_test(int volume)
+                     phase += 2.0f * (float)M_PI * f / MUSE_AUDIO_RATE;
+                     s_out_stereo[2 * i] = s_out_stereo[2 * i + 1] = v;
+                 }
+-                esp_codec_dev_write(s_spk, s_out_stereo, sizeof(s_out_stereo));
+-                esp_codec_dev_read(s_mic, s_in_stereo, sizeof(s_in_stereo));
++                codec_write(s_out_stereo, sizeof(s_out_stereo));
++                codec_read(s_in_stereo, sizeof(s_in_stereo));
+                 /* Skip the first SKIP*2 frames: DMA latency plus the previous tone's tail. */
+                 if (n >= 2 * SKIP && got + MUSE_AUDIO_CHUNK <= MEAS) {
+                     memcpy(cap + got * CHANNELS, s_in_stereo, sizeof(s_in_stereo));
+@@ -263,7 +286,7 @@ esp_err_t muse_audio_read(int16_t *mono, size_t frames)
+ {
+     while (frames) {
+         size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
+-        if (esp_codec_dev_read(s_mic, s_in_stereo, n * CHANNELS * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
++        if (codec_read(s_in_stereo, n * CHANNELS * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
+             return ESP_FAIL;
+         }
+         for (size_t i = 0; i < n; i++) {
+@@ -291,7 +314,7 @@ esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
+             s_out_stereo[2 * i] = mute ? 0 : mono[i];
+             s_out_stereo[2 * i + 1] = mute ? 0 : mono[i];
+         }
+-        if (esp_codec_dev_write(s_spk, s_out_stereo, n * CHANNELS * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
++        if (codec_write(s_out_stereo, n * CHANNELS * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
+             return ESP_FAIL;
+         }
+         mono += n;
 diff --git a/esp32/components/muse/muse_brain_audio.c b/esp32/components/muse/muse_brain_audio.c
 new file mode 100644
 index 0000000..9b92d2b
@@ -1369,6 +1539,119 @@ index c96e3ca..72928f5 100644
          } else if (c == 'a' || c == 's') {
              muse_state_poke();
              muse_menu_key(c == 'a' ? MUSE_MENU_DOWN : MUSE_MENU_SELECT);
+diff --git a/esp32/components/muse/muse_io_watch.c b/esp32/components/muse/muse_io_watch.c
+new file mode 100644
+index 0000000..f798e44
+--- /dev/null
++++ b/esp32/components/muse/muse_io_watch.c
+@@ -0,0 +1,69 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "muse_io_watch.h"
++
++#include "esp_attr.h"
++#include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
++
++typedef struct {
++    int64_t since_us;
++    bool pending;
++} io_watch_t;
++
++static io_watch_t s_watch[MUSE_IO_COUNT];
++static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
++
++void IRAM_ATTR muse_io_watch_begin(muse_io_t io)
++{
++    portENTER_CRITICAL_SAFE(&s_lock);
++    if (!s_watch[io].pending) {
++        s_watch[io].since_us = esp_timer_get_time();
++        s_watch[io].pending = true;
++    }
++    portEXIT_CRITICAL_SAFE(&s_lock);
++}
++
++void IRAM_ATTR muse_io_watch_end(muse_io_t io, bool success)
++{
++    portENTER_CRITICAL_SAFE(&s_lock);
++    if (success) {
++        s_watch[io].pending = false;
++    }
++    portEXIT_CRITICAL_SAFE(&s_lock);
++}
++
++uint32_t muse_io_watch_oldest(muse_io_t *io)
++{
++    int64_t age = 0;
++    portENTER_CRITICAL_SAFE(&s_lock);
++    int64_t now = esp_timer_get_time();
++    for (int i = 0; i < MUSE_IO_COUNT; i++) {
++        if (s_watch[i].pending && now - s_watch[i].since_us > age) {
++            age = now - s_watch[i].since_us;
++            *io = (muse_io_t)i;
++        }
++    }
++    portEXIT_CRITICAL_SAFE(&s_lock);
++    return age / 1000 > UINT32_MAX ? UINT32_MAX : (uint32_t)(age / 1000);
++}
++
++const char *muse_io_watch_name(muse_io_t io)
++{
++    static const char *names[] = { "I2S RX", "I2S TX", "audio power", "LCD flush", "LCD command" };
++    return io < MUSE_IO_COUNT ? names[io] : "none";
++}
+diff --git a/esp32/components/muse/muse_io_watch.h b/esp32/components/muse/muse_io_watch.h
+new file mode 100644
+index 0000000..3dc8635
+--- /dev/null
++++ b/esp32/components/muse/muse_io_watch.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++typedef enum {
++    MUSE_IO_RX, MUSE_IO_TX, MUSE_IO_AUDIO_POWER, MUSE_IO_LCD_FLUSH, MUSE_IO_LCD_CALL,
++    MUSE_IO_COUNT
++} muse_io_t;
++
++/* Tracks outstanding work, not inactivity. ISR-safe; no allocation or blocking
++ * lock. Repeated errors retain the first failure's age until success. */
++void muse_io_watch_begin(muse_io_t io);
++void muse_io_watch_end(muse_io_t io, bool success);
++uint32_t muse_io_watch_oldest(muse_io_t *io);
++const char *muse_io_watch_name(muse_io_t io);
 diff --git a/esp32/components/muse/muse_link.c b/esp32/components/muse/muse_link.c
 index b42f8fa..fd4834f 100644
 --- a/esp32/components/muse/muse_link.c
@@ -1389,10 +1672,10 @@ index b42f8fa..fd4834f 100644
  
  void muse_wifi_nap(bool nap)
 diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
-index 35a7ff4..5ff1e69 100644
+index 35a7ff4..5aae285 100644
 --- a/esp32/components/muse/muse_voice.c
 +++ b/esp32/components/muse/muse_voice.c
-@@ -24,12 +24,22 @@
+@@ -24,12 +24,23 @@
  #include "esp_heap_caps.h"
  #include "esp_log.h"
  #include "esp_timer.h"
@@ -1408,6 +1691,7 @@ index 35a7ff4..5ff1e69 100644
  
  #include "muse_adpcm.h"
  #include "muse_audio.h"
++#include "muse_io_watch.h"
 +#include "muse_link.h"
 +#include "muse_settings.h"
 +#include "muse_wifi.h"
@@ -1415,7 +1699,7 @@ index 35a7ff4..5ff1e69 100644
  #include "muse_board.h"
  #include "muse_chat.h"
  #include "muse_input.h"
-@@ -37,8 +47,22 @@
+@@ -37,8 +48,22 @@
  #include "muse_settings.h"
  #include "muse_state.h"
  #include "muse_wifi.h"
@@ -1438,7 +1722,7 @@ index 35a7ff4..5ff1e69 100644
  
  #define MAX_SECS 15
  #define TAIL_FRAMES (MUSE_AUDIO_RATE * 12 / 100)   /* capture lag + poll interval, stops before the release click */
-@@ -62,7 +86,7 @@ static const char *TAG = "muse_voice";
+@@ -62,7 +87,7 @@ static const char *TAG = "muse_voice";
  #define HELD_TRIES 8                            /* then a saved note is dropped */
  #define HELD_POLL_MS 5000                       /* resting with notes saved: check for Wi-Fi this often */
  #define HELD_KEEP_US (30LL * 60 * 1000000)      /* muse_voice_notes_waiting() */
@@ -1447,7 +1731,7 @@ index 35a7ff4..5ff1e69 100644
  #define RETRY_MAX_US (120LL * 1000000)
  #define STALL_US (30LL * 1000000)               /* Hatch took none of a note this long: give up */
  #define ACK_WAIT_US (30LL * 1000000)            /* asleep, waiting for the VM to have a note */
-@@ -73,6 +97,22 @@ static volatile float s_monitor_db = -100.0f;
+@@ -73,6 +98,22 @@ static volatile float s_monitor_db = -100.0f;
  static volatile bool s_chirp;
  static volatile bool s_loopback;
  static volatile bool s_mp3test;
@@ -1470,7 +1754,7 @@ index 35a7ff4..5ff1e69 100644
  
  /*
   * Pre-roll: while idle the mic keeps running into this ring, so a recording
-@@ -262,7 +302,24 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -262,7 +303,24 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
      rec_stats_t st = { 0 };
  
      size_t n = 0;
@@ -1496,7 +1780,7 @@ index 35a7ff4..5ff1e69 100644
          /* Pressed during playback: the queued tail of the reply is still sounding. */
          for (int i = 0; i < SETTLE_CHUNKS; i++) {
              muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK);
-@@ -274,9 +331,9 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -274,9 +332,9 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
              n += MUSE_AUDIO_CHUNK;
          }
      }
@@ -1509,7 +1793,7 @@ index 35a7ff4..5ff1e69 100644
      while (n + MUSE_AUDIO_CHUNK <= stop_at) {
          if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
              break;
-@@ -320,7 +377,23 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -320,7 +378,23 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
              released = true;
              stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
          }
@@ -1533,7 +1817,7 @@ index 35a7ff4..5ff1e69 100644
      muse_state_set_level(0);
      *held = n - pre;
  
-@@ -401,10 +474,15 @@ static bool hatch_reply(bool *delivered)
+@@ -401,10 +475,15 @@ static bool hatch_reply(bool *delivered)
          if (n) {
              if (!speaking) {
                  speaking = true;
@@ -1550,7 +1834,7 @@ index 35a7ff4..5ff1e69 100644
              muse_audio_write(buf, n);
              played += n;
          } else if (done) {
-@@ -420,8 +498,8 @@ static bool hatch_reply(bool *delivered)
+@@ -420,8 +499,8 @@ static bool hatch_reply(bool *delivered)
          }
      }
      muse_state_set_level(0);
@@ -1561,7 +1845,7 @@ index 35a7ff4..5ff1e69 100644
      if (!played) {
          /* No speech (TTS unavailable): leave the reply text up for a moment. */
          vTaskDelay(pdMS_TO_TICKS(2500));
-@@ -786,11 +864,184 @@ static bool can_record(void)
+@@ -786,11 +865,194 @@ static bool can_record(void)
      return true;
  }
  
@@ -1706,30 +1990,40 @@ index 35a7ff4..5ff1e69 100644
 +{
 +    uint32_t last = 0;
 +    TickType_t moved = xTaskGetTickCount();
++    TickType_t dumped = moved;
++    TickType_t health = moved;
 +    for (;;) {
-+        vTaskDelay(pdMS_TO_TICKS(10000));
++        vTaskDelay(pdMS_TO_TICKS(1000));
++        TickType_t now = xTaskGetTickCount();
 +        uint32_t beat = s_voice_beat;
 +        if (beat != last) {
 +            last = beat;
-+            moved = xTaskGetTickCount();
-+            continue;
++            moved = now;
++            dumped = now;
 +        }
-+        TickType_t stalled = xTaskGetTickCount() - moved;
-+        if (stalled > pdMS_TO_TICKS(360000)) {
-+            /* A stall this long has never recovered (I2S RX / LCD DMA
-+             * completion silently lost); a reboot turns a brick back into
-+             * a gadget. The dump above is already in the serial log. */
-+            ESP_LOGE(TAG, "coroner: muse_voice stalled %d s — rebooting to recover",
-+                     (int)(stalled / configTICK_RATE_HZ));
++        /* A healthy device can sleep for a minute or wait longer for a cloud
++         * reply. Only outstanding peripheral work gets the short deadline. */
++        muse_io_t io = MUSE_IO_COUNT;
++        uint32_t io_ms = muse_io_watch_oldest(&io);
++        TickType_t stalled = now - moved;
++        if (io_ms >= 20000 || stalled >= pdMS_TO_TICKS(360000)) {
++            ESP_LOGE(TAG, "coroner: %s stalled %lu ms, voice idle %lu s — rebooting to recover",
++                     muse_io_watch_name(io), (unsigned long)io_ms,
++                     (unsigned long)(stalled / configTICK_RATE_HZ));
 +            muse_voice_dump_tasks();
-+            vTaskDelay(pdMS_TO_TICKS(3000));   /* let the dump drain */
++            vTaskDelay(pdMS_TO_TICKS(3000));   /* let the zero-malloc dump drain */
 +            esp_restart();
 +        }
-+        if (stalled > pdMS_TO_TICKS(300000)) {
-+            ESP_LOGE(TAG, "coroner: muse_voice stalled %d s — all-task backtrace follows",
-+                     (int)(stalled / configTICK_RATE_HZ));
++        if (stalled >= pdMS_TO_TICKS(300000) && now - dumped >= pdMS_TO_TICKS(300000)) {
++            ESP_LOGE(TAG, "coroner: muse_voice stalled %lu s — all-task backtrace follows",
++                     (unsigned long)(stalled / configTICK_RATE_HZ));
 +            muse_voice_dump_tasks();
-+            moved = xTaskGetTickCount();   /* re-dump each 5 min while stalled */
++            dumped = now;   /* never reset the stall clock when dumping */
++        }
++        if (now - health >= pdMS_TO_TICKS(60000)) {
++            ESP_LOGI(TAG, "health: voice beat=%lu resting=%d io=%s age=%lu ms",
++                     (unsigned long)beat, (int)s_resting, muse_io_watch_name(io), (unsigned long)io_ms);
++            health = now;
 +        }
 +    }
 +}
@@ -1746,7 +2040,7 @@ index 35a7ff4..5ff1e69 100644
          bool wake = false;
          if (!pending_down) {
              muse_input_event_t ev;
-@@ -828,6 +1079,38 @@ static void voice_task(void *arg)
+@@ -828,6 +1090,38 @@ static void voice_task(void *arg)
                  muse_audio_chirp(1);
                  pre_reset();
              }
@@ -1785,7 +2079,7 @@ index 35a7ff4..5ff1e69 100644
              if (s_mp3test) {
                  s_mp3test = false;
                  int16_t *pcm = NULL;
-@@ -845,6 +1128,11 @@ static void voice_task(void *arg)
+@@ -845,6 +1139,11 @@ static void voice_task(void *arg)
              }
              /* The 20 ms read paces this loop. */
              idle_capture();
@@ -1797,7 +2091,7 @@ index 35a7ff4..5ff1e69 100644
              if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
                  continue;
              }
-@@ -866,6 +1154,12 @@ static void voice_task(void *arg)
+@@ -866,6 +1165,12 @@ static void voice_task(void *arg)
          char why[96];
          bool ok = record(pending_down, &held, why, sizeof(why));
          pending_down = false;
@@ -1810,7 +2104,7 @@ index 35a7ff4..5ff1e69 100644
          if (held < MIN_HELD_FRAMES && !wake) {
              muse_hatch_turn_cancel();
              drop_rec();
-@@ -887,6 +1181,26 @@ static void voice_task(void *arg)
+@@ -887,6 +1192,26 @@ static void voice_task(void *arg)
      }
  }
  
@@ -1837,7 +2131,7 @@ index 35a7ff4..5ff1e69 100644
  esp_err_t muse_voice_start(QueueHandle_t queue)
  {
      s_queue = queue;
-@@ -897,10 +1211,37 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
+@@ -897,10 +1222,37 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
          return ESP_FAIL;
      }
      /* Stack in PSRAM if there is any (this task never writes flash) to spare internal RAM for Wi-Fi/BLE. */
@@ -1876,7 +2170,7 @@ index 35a7ff4..5ff1e69 100644
      return ESP_OK;
  }
  
-@@ -933,6 +1274,14 @@ void muse_voice_request_mp3test(void)
+@@ -933,6 +1285,14 @@ void muse_voice_request_mp3test(void)
      muse_state_nudge();
  }
  
@@ -3623,6 +3917,151 @@ index 7847475..83b2bef 100644
 +
 +    def test_muse_agent_keeps_its_followup_window(self):
 +        self.run_case(4)
+diff --git a/esp32/tests/test_muse_io_watch.py b/esp32/tests/test_muse_io_watch.py
+new file mode 100644
+index 0000000..74a1633
+--- /dev/null
++++ b/esp32/tests/test_muse_io_watch.py
+@@ -0,0 +1,139 @@
++"""Exercise real peripheral deadline code with a deterministic host clock."""
++import os, shlex, subprocess, tempfile, unittest
++from pathlib import Path
++ROOT = Path(__file__).resolve().parents[1]
++
++class IoWatch(unittest.TestCase):
++    def test_pending_errors_recovery_sleep_and_independent_peripherals(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            out = Path(tmp)
++            (out / 'freertos').mkdir()
++            (out / 'esp_attr.h').write_text('#define IRAM_ATTR\n')
++            (out / 'esp_timer.h').write_text('#include <stdint.h>\nint64_t esp_timer_get_time(void);\n')
++            (out / 'freertos/FreeRTOS.h').write_text("""
++typedef int portMUX_TYPE;
++#define portMUX_INITIALIZER_UNLOCKED 0
++#define portENTER_CRITICAL_SAFE(p) ((void)(p))
++#define portEXIT_CRITICAL_SAFE(p) ((void)(p))
++""")
++            (out / 'driver.c').write_text(r"""
++#include <assert.h>
++#include <stdint.h>
++#include "muse_io_watch.h"
++static int64_t now;
++int64_t esp_timer_get_time(void) { return now; }
++static uint32_t age(muse_io_t want) {
++    muse_io_t actual = MUSE_IO_COUNT;
++    uint32_t ms = muse_io_watch_oldest(&actual);
++    assert(actual == want);
++    return ms;
++}
++int main(void) {
++    assert(age(MUSE_IO_COUNT) == 0);
++    /* A sleeping device with no I/O must never be considered wedged. */
++    now = 600000000;
++    assert(age(MUSE_IO_COUNT) == 0);
++    muse_io_watch_begin(MUSE_IO_RX);
++    now += 19999000;
++    assert(age(MUSE_IO_RX) == 19999);
++    now += 1000;
++    assert(age(MUSE_IO_RX) == 20000);
++    /* A returning driver error and further failed reads are still a stall. */
++    muse_io_watch_end(MUSE_IO_RX, false);
++    now += 1000000;
++    muse_io_watch_begin(MUSE_IO_RX);
++    assert(age(MUSE_IO_RX) == 21000);
++    muse_io_watch_end(MUSE_IO_RX, true);
++    assert(age(MUSE_IO_COUNT) == 0);
++    /* Healthy RX cannot mask an independent lost LCD completion. */
++    muse_io_watch_begin(MUSE_IO_LCD_FLUSH);
++    for (int i = 0; i < 1100; i++) {
++        muse_io_watch_begin(MUSE_IO_RX);
++        now += 20000;
++        muse_io_watch_end(MUSE_IO_RX, true);
++    }
++    assert(age(MUSE_IO_LCD_FLUSH) == 22000);
++    muse_io_watch_end(MUSE_IO_LCD_FLUSH, true);
++    assert(age(MUSE_IO_COUNT) == 0);
++    /* A stalled power transition must remain visible even when resting. */
++    muse_io_watch_begin(MUSE_IO_AUDIO_POWER);
++    now += 21000000;
++    assert(age(MUSE_IO_AUDIO_POWER) == 21000);
++    muse_io_watch_end(MUSE_IO_AUDIO_POWER, true);
++    /* 64-bit clock: no false reset around a 32-bit microsecond rollover. */
++    now = UINT32_MAX - 1000000LL;
++    muse_io_watch_begin(MUSE_IO_TX);
++    now += 23000000;
++    assert(age(MUSE_IO_TX) == 23000);
++    muse_io_watch_end(MUSE_IO_TX, true);
++    now += 360000000;
++    assert(age(MUSE_IO_COUNT) == 0);
++}
++""")
++            binary = out / 'watch'
++            cmd = [*shlex.split(os.environ.get('CC', 'cc')), '-std=c11', '-Wall', '-Wextra', '-Werror',
++                   '-I', str(out), '-I', str(ROOT / 'components/muse'), str(out / 'driver.c'),
++                   str(ROOT / 'components/muse/muse_io_watch.c'), '-o', str(binary)]
++            subprocess.run(cmd, check=True, capture_output=True)
++            subprocess.run([str(binary)], check=True, capture_output=True)
++
++    def test_coroner_fast_deadline_sleep_and_dump_do_not_delay_restart(self):
++        source = (ROOT / 'components/muse/muse_voice.c').read_text()
++        start = source.index('static void coroner_task(void *arg)')
++        coroner = source[start:source.index('\nstatic TaskHandle_t s_voice_task;', start)]
++        with tempfile.TemporaryDirectory() as tmp:
++            out = Path(tmp)
++            driver = r"""
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <setjmp.h>
++#include "muse_io_watch.h"
++typedef uint32_t TickType_t;
++#define pdMS_TO_TICKS(n) (n)
++#define configTICK_RATE_HZ 1000
++#define ESP_LOGE(...) ((void)0)
++#define ESP_LOGI(...) ((void)0)
++static uint32_t now, s_voice_beat, dumps, restarted;
++static bool s_resting;
++static int mode;
++static jmp_buf stop;
++static TickType_t xTaskGetTickCount(void) { return now; }
++static void vTaskDelay(uint32_t ms) {
++    now += ms;
++    /* 1: healthy voice while LCD is stuck. 2: normal minute-long sleep. */
++    if (mode == 1) s_voice_beat++;
++    if (mode == 2) s_voice_beat = now / 60000;
++    if (now > 700000) longjmp(stop, 1);
++}
++uint32_t muse_io_watch_oldest(muse_io_t *io) {
++    if (mode == 1) { *io = MUSE_IO_LCD_FLUSH; return now; }
++    return 0;
++}
++const char *muse_io_watch_name(muse_io_t io) { (void)io; return "test"; }
++static void muse_voice_dump_tasks(void) { dumps++; }
++static void esp_restart(void) { restarted = now; longjmp(stop, 1); }
++""" + coroner + r"""
++int main(int argc, char **argv) {
++    (void)argc; mode = atoi(argv[1]); s_resting = mode == 2;
++    if (!setjmp(stop)) coroner_task(NULL);
++    printf("%u %u\n", restarted, dumps);
++}
++"""
++            (out / 'driver.c').write_text(driver)
++            binary = out / 'coroner'
++            subprocess.run([*shlex.split(os.environ.get('CC', 'cc')), '-std=c11', '-Wall',
++                            '-Wno-unused-parameter', '-I', str(ROOT / 'components/muse'),
++                            str(out / 'driver.c'), '-o', str(binary)], check=True, capture_output=True)
++            def run(mode):
++                result = subprocess.run([str(binary), str(mode)], check=True, capture_output=True, text=True)
++                return tuple(map(int, result.stdout.split()))
++            restart, dumps = run(1)
++            self.assertGreaterEqual(restart, 23000)
++            self.assertLessEqual(restart, 24000)
++            self.assertEqual(dumps, 1)
++            self.assertEqual(run(2), (0, 0))
++            restart, dumps = run(0)
++            self.assertEqual(restart, 363000)
++            self.assertEqual(dumps, 2)
 diff --git a/esp32/tests/test_muse_voice_note.py b/esp32/tests/test_muse_voice_note.py
 index 8403bec..babb820 100644
 --- a/esp32/tests/test_muse_voice_note.py
