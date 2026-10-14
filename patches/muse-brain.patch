@@ -60,7 +60,7 @@ index d5cfdec..5a25ddc 100644
    lvgl/lvgl:
      version: "9.5.0"
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index a6ad810..058bcc7 100644
+index a6ad810..101d6dc 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
 @@ -52,6 +52,7 @@
@@ -205,7 +205,7 @@ index a6ad810..058bcc7 100644
          }
          muse_hatch_console("message_done", nullptr, "\"msg\":%d,\"bytes\":%u", i, (unsigned)n);
          ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)n);
-@@ -1499,6 +1566,595 @@ static void on_chat_ack(stream_t *s)
+@@ -1499,6 +1566,611 @@ static void on_chat_ack(stream_t *s)
      emit(MUSE_HATCH_EV_SENT, nullptr);
  }
  
@@ -470,10 +470,14 @@ index a6ad810..058bcc7 100644
 +
 +static bool brain_stt(const uint8_t *wav, size_t len, char *out, size_t outlen)
 +{
-+    char head[320];
++    char head[640];
 +    snprintf(head, sizeof(head),
 +             "--" BRAIN_BOUNDARY "\r\n"
 +             "Content-Disposition: form-data; name=\"model\"\r\n\r\n" BRAIN_STT_MODEL "\r\n"
++             "--" BRAIN_BOUNDARY "\r\n"
++             "Content-Disposition: form-data; name=\"language\"\r\n\r\n" BRAIN_STT_LANG "\r\n"
++             "--" BRAIN_BOUNDARY "\r\n"
++             "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n" BRAIN_STT_PROMPT "\r\n"
 +             "--" BRAIN_BOUNDARY "\r\n"
 +             "Content-Disposition: form-data; name=\"file\"; filename=\"note.wav\"\r\n"
 +             "Content-Type: audio/wav\r\n\r\n");
@@ -483,8 +487,20 @@ index a6ad810..058bcc7 100644
 +    memcpy(s_brain_post, head, hlen);
 +    memcpy(s_brain_post + hlen, wav, len);
 +    memcpy(s_brain_post + hlen + len, tail, tlen);
-+    if (!openai_perform(BRAIN_STT_URL, BRAIN_CHAT_KEY, "multipart/form-data; boundary=" BRAIN_BOUNDARY,
-+                    reinterpret_cast<const char *>(s_brain_post), hlen + len + tlen, 1)) {
++    /* A reused keep-alive socket the server just closed yields a 0-byte 200;
++     * retry once right away instead of punting to the slow note path. */
++    bool got = false;
++    for (int attempt = 0; attempt < 2 && !got; attempt++) {
++        if (!openai_perform(BRAIN_STT_URL, BRAIN_CHAT_KEY, "multipart/form-data; boundary=" BRAIN_BOUNDARY,
++                        reinterpret_cast<const char *>(s_brain_post), hlen + len + tlen, 1)) {
++            ESP_LOGE(TAG, "STT http failed (attempt %d)", attempt);
++            continue;
++        }
++        ESP_LOGI(TAG, "STT resp %u bytes: %.200s", (unsigned)s_http_sink_len,
++                 s_http_sink ? (const char *)s_http_sink : "(null)");
++        got = s_http_sink_len > 0;
++    }
++    if (!got) {
 +        return false;
 +    }
 +    cJSON *root = cJSON_Parse(s_http_sink);
@@ -801,7 +817,7 @@ index a6ad810..058bcc7 100644
  /* ---- Turn: speech ---- */
  
  static void start_tts(void)
-@@ -1526,6 +2182,34 @@ static void start_tts(void)
+@@ -1526,6 +2198,34 @@ static void start_tts(void)
           * end. decode() plays it at the speaker's volume, captions following,
           * and finishes the message once it's drained.
           */
@@ -836,7 +852,7 @@ index a6ad810..058bcc7 100644
          m.pcm_start = s_turn.pcm_out;
          m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
          m.tts = TTS_ACTIVE;
-@@ -1540,6 +2224,7 @@ static void start_tts(void)
+@@ -1540,6 +2240,7 @@ static void start_tts(void)
  static void tts_data(const uint8_t *data, size_t len)
  {
      if (s_turn.mp3_len + len > MP3_BUF) {
@@ -844,7 +860,7 @@ index a6ad810..058bcc7 100644
          ESP_LOGW(TAG, "MP3 buffer full, dropping %u bytes", (unsigned)len);
          len = MP3_BUF - s_turn.mp3_len;
      }
-@@ -1880,7 +2565,7 @@ static void drop_connection(const char *why)
+@@ -1880,7 +2581,7 @@ static void drop_connection(const char *why)
      bool in_turn = s_turn.phase != P_IDLE;
      disconnect(why);
      s_auto_next_us = now_us() + s_auto_backoff_us;
@@ -853,7 +869,7 @@ index a6ad810..058bcc7 100644
          turn_fail("LOST CONNECTION TO MUSE");
      }
      muse_hatch_report(MUSE_HATCH_UNTESTED, "");
-@@ -1954,11 +2639,14 @@ static void hatch_task(void *arg)
+@@ -1954,11 +2655,14 @@ static void hatch_task(void *arg)
                  handle(cmd);
              }
          }
@@ -870,7 +886,7 @@ index a6ad810..058bcc7 100644
                  if (ensure_connected()) {
                      s_auto_next_us = INT64_MAX;   /* until it drops */
                      s_auto_backoff_us = AUTO_RETRY_MIN_US;
-@@ -1972,16 +2660,16 @@ static void hatch_task(void *arg)
+@@ -1972,16 +2676,16 @@ static void hatch_task(void *arg)
          }
  
          /* Resting, Wi-Fi may nap; don't wait for the server to go quiet. */
@@ -890,7 +906,7 @@ index a6ad810..058bcc7 100644
              sent = VOICE_NOTE ? record_note() : pump_mic();
          }
          if (!sent) {
-@@ -1990,24 +2678,33 @@ static void hatch_task(void *arg)
+@@ -1990,24 +2694,33 @@ static void hatch_task(void *arg)
          }
          if (s_turn.phase == P_WAIT_REPLY) {
              start_tts();
@@ -936,7 +952,7 @@ index a6ad810..058bcc7 100644
              }
          }
      }
-@@ -2037,6 +2734,9 @@ extern "C" void muse_hatch_start(void)
+@@ -2037,6 +2750,9 @@ extern "C" void muse_hatch_start(void)
      }
      cJSON_Hooks hooks = { json_alloc, heap_caps_free };
      cJSON_InitHooks(&hooks);
@@ -946,7 +962,7 @@ index a6ad810..058bcc7 100644
      /* Keep the command/event queues out of internal DRAM, which Wi-Fi, BLE and
       * mbedTLS can exhaust: when the allocation failed here hatch_task never
       * started and every turn was silently dropped. Fall back to internal RAM
-@@ -2054,6 +2754,14 @@ extern "C" void muse_hatch_start(void)
+@@ -2054,6 +2770,14 @@ extern "C" void muse_hatch_start(void)
      s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
      s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
      s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;
@@ -961,7 +977,7 @@ index a6ad810..058bcc7 100644
      s_turn.texts = static_cast<char *>(psram_alloc(MAX_MSGS * TEXT_MAX));   /* captions just stay untimed without it */
      s_pcm = static_cast<int16_t *>(psram_alloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)));
      s_pcm16 = static_cast<int16_t *>(psram_alloc((MINIMP3_MAX_SAMPLES_PER_FRAME + 8) * sizeof(int16_t)));
-@@ -2064,6 +2772,7 @@ extern "C" void muse_hatch_start(void)
+@@ -2064,6 +2788,7 @@ extern "C" void muse_hatch_start(void)
      s_turn.tts_msg = -1;
      /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here. */
      if (!s_cmds || !s_events || !s_in || !s_out || !s_turn.chunk || !s_turn.mp3 || (VOICE_NOTE && !s_turn.note) || !s_pcm || !s_pcm16 ||
@@ -985,7 +1001,7 @@ index c96e3ca..07a6d82 100644
              muse_state_poke();
              muse_menu_key(c == 'a' ? MUSE_MENU_DOWN : MUSE_MENU_SELECT);
 diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
-index 35a7ff4..1d82ef6 100644
+index 35a7ff4..d097bc7 100644
 --- a/esp32/components/muse/muse_voice.c
 +++ b/esp32/components/muse/muse_voice.c
 @@ -30,6 +30,10 @@
@@ -1022,6 +1038,15 @@ index 35a7ff4..1d82ef6 100644
  
  #define MAX_SECS 15
  #define TAIL_FRAMES (MUSE_AUDIO_RATE * 12 / 100)   /* capture lag + poll interval, stops before the release click */
+@@ -62,7 +80,7 @@ static const char *TAG = "muse_voice";
+ #define HELD_TRIES 8                            /* then a saved note is dropped */
+ #define HELD_POLL_MS 5000                       /* resting with notes saved: check for Wi-Fi this often */
+ #define HELD_KEEP_US (30LL * 60 * 1000000)      /* muse_voice_notes_waiting() */
+-#define RETRY_MIN_US (15LL * 1000000)
++#define RETRY_MIN_US (2LL * 1000000)
+ #define RETRY_MAX_US (120LL * 1000000)
+ #define STALL_US (30LL * 1000000)               /* Hatch took none of a note this long: give up */
+ #define ACK_WAIT_US (30LL * 1000000)            /* asleep, waiting for the VM to have a note */
 @@ -73,6 +91,20 @@ static volatile float s_monitor_db = -100.0f;
  static volatile bool s_chirp;
  static volatile bool s_loopback;
@@ -1172,10 +1197,11 @@ index 35a7ff4..1d82ef6 100644
  static void voice_task(void *arg)
  {
      bool pending_down = false;
-@@ -828,6 +951,22 @@ static void voice_task(void *arg)
+@@ -828,6 +951,24 @@ static void voice_task(void *arg)
                  muse_audio_chirp(1);
                  pre_reset();
              }
++#if WAKE_WORD
 +            if (s_wake_test) {
 +                s_wake_test = false;
 +                ESP_LOGI(TAG, "wake test: playing phrase");
@@ -1192,10 +1218,11 @@ index 35a7ff4..1d82ef6 100644
 +                }
 +                pre_reset();
 +            }
++#endif
              if (s_mp3test) {
                  s_mp3test = false;
                  int16_t *pcm = NULL;
-@@ -845,6 +984,11 @@ static void voice_task(void *arg)
+@@ -845,6 +986,11 @@ static void voice_task(void *arg)
              }
              /* The 20 ms read paces this loop. */
              idle_capture();
@@ -1207,7 +1234,7 @@ index 35a7ff4..1d82ef6 100644
              if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
                  continue;
              }
-@@ -866,6 +1010,12 @@ static void voice_task(void *arg)
+@@ -866,6 +1012,12 @@ static void voice_task(void *arg)
          char why[96];
          bool ok = record(pending_down, &held, why, sizeof(why));
          pending_down = false;
@@ -1220,7 +1247,7 @@ index 35a7ff4..1d82ef6 100644
          if (held < MIN_HELD_FRAMES && !wake) {
              muse_hatch_turn_cancel();
              drop_rec();
-@@ -887,6 +1037,26 @@ static void voice_task(void *arg)
+@@ -887,6 +1039,26 @@ static void voice_task(void *arg)
      }
  }
  
@@ -1247,7 +1274,7 @@ index 35a7ff4..1d82ef6 100644
  esp_err_t muse_voice_start(QueueHandle_t queue)
  {
      s_queue = queue;
-@@ -897,10 +1067,23 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
+@@ -897,10 +1069,23 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
          return ESP_FAIL;
      }
      /* Stack in PSRAM if there is any (this task never writes flash) to spare internal RAM for Wi-Fi/BLE. */
@@ -1272,14 +1299,16 @@ index 35a7ff4..1d82ef6 100644
      return ESP_OK;
  }
  
-@@ -933,6 +1116,12 @@ void muse_voice_request_mp3test(void)
+@@ -933,6 +1118,14 @@ void muse_voice_request_mp3test(void)
      muse_state_nudge();
  }
  
 +void muse_voice_request_waketest(void)
 +{
++#if WAKE_WORD
 +    s_wake_test = true;
 +    muse_state_nudge();
++#endif
 +}
 +
  bool muse_voice_resting(void)

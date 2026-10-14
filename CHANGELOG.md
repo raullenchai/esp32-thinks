@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.2 — 2026-10-14 — Chinese-first STT + resilient transcription
+
+First round of real-human testing surfaced three transcription bugs; all fixed on device and verified end to end (knob → record → STT → brain → spoken reply, Chinese in / Chinese out).
+
+- **STT language pin** — Whisper was auto-detecting the language on short notes and hallucinating Korean on room noise; `BRAIN_STT_LANG` (`zh` by default) and a `BRAIN_STT_PROMPT` ("以下是普通话的句子。") are sent with every transcription request.
+- **Instant STT retry** — a keep-alive socket the server just closed yields a silent 0-byte 200; `brain_stt` now retries once immediately instead of punting to the saved-note path (which waited 15 s before its first resend).
+- **Faster note retries** — `RETRY_MIN_US` 15 s → 2 s (still exponential up to 120 s), so a failed turn comes back in seconds, not half a minute.
+- **STT diagnostics** — the device logs every transcription response (size + body) and any HTTP failure with the status code; no more silent `BRAIN STT FAILED`.
+- **`WAKE_WORD 0` builds clean** — the wake-test path is now `#if WAKE_WORD`-guarded, so disabling the wake word compiles (and frees the WakeNet internal-RAM budget).
+- Known issue: after 1–6 h of runtime the audio/input tasks can wedge (buttons dead, `k`/`l` silent) until reboot; heartbeats and wake detection keep running. Under investigation.
+
 ## v0.2.1 — 2026-10-13 — wake word: "Hi, ESP"
 
 The gadget now has both ears: **say "Hi, ESP" or press the knob** — both start a turn. Detection is esp-sr WakeNet10 `wn10_hiesp` running on-chip (direct WakeNet, no AFE); on detect it synthesizes a `MUSE_PTT_DOWN` into the same input queue, so recording, VAD end-of-turn and the reply flow are exactly the button's.
