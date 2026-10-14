@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.3 — 2026-10-14 — watchdog + coroner: the wedge leaves evidence
+
+The v0.2.2 known issue (device wedges after 1–6 h, buttons dead, `k`/`l` silent) now leaves evidence instead of silence. Two freezes were caught in the act; both showed the same signature: `muse_voice` blocked, `lvgl` spinning in `lv_refr_wait_for_flushing` — the display flush never completes, so the LVGL lock is never released and the voice task dies updating its caption.
+
+- **Task watchdog** — `CONFIG_ESP_TASK_WDT_EN` on; `muse_voice` subscribes and reconfigures the timeout to 300 s at boot. A wedged voice task gets its backtrace logged (and re-logged every 5 min) instead of the device sitting quietly.
+- **Coroner task** — if the voice task stalls ≥300 s, a low-priority coroner dumps the backtrace of **every** task to the console. It allocates nothing: static PSRAM buffers and a re-entrancy guard, because in a wedged system the heap lock may be held by the very path being autopsied — a malloc there kills the coroner too (v1 learned this the hard way; its second run produced no dump at all).
+- **`>tasks` console command** — dump all task backtraces on demand from the serial console; answers even while everything else is frozen.
+- Root cause of the flush hang is still open; the next freeze now leaves a full stack dump in the serial log (baseline when healthy: `voice_task → idle_capture → muse_audio_read → i2s_channel_read`).
+
 ## v0.2.2 — 2026-10-14 — Chinese-first STT + resilient transcription
 
 First round of real-human testing surfaced three transcription bugs; all fixed on device and verified end to end (knob → record → STT → brain → spoken reply, Chinese in / Chinese out).
