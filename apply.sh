@@ -22,7 +22,7 @@ cd "$SDK"
 echo "== muse-gadget-sdk @ $(git rev-parse --short HEAD) (recipe tested against 812c46f)"
 
 # 1) Pinned root CAs (both public): Google Trust Services R4 for api.openai.com,
-#    ISRG Root X1 for Let's Encrypt hosts (QuickSilver and most others).
+#    Root YE + ISRG Root X1 for Let's Encrypt hosts (QuickSilver and others).
 cp "$REPO_DIR/files/openai_root_ca.pem" esp32/components/muse/openai_root_ca.pem
 cp "$REPO_DIR/files/qs_root_ca.pem"     esp32/components/muse/qs_root_ca.pem
 
@@ -39,13 +39,14 @@ TTS_MODEL_CJK=""              # optional second voice model for Chinese turns
 TTS_KEY=""
 STT_URL="https://api.openai.com/v1/audio/transcriptions"
 STT_MODEL="whisper-1"
+STT_ADPCM=0                                    # opt in only with a verified WAV decoder
 STT_LANG="zh"                                   # pin Whisper's language ("auto" = let it guess)
 STT_PROMPT="以下是普通话的句子。"                    # prompt nudge in that language
 CHAT_URL="https://api.openai.com/v1"
 CHAT_KEY=""
 CHAT_MODEL="gpt-4o-mini"
 CHAT_EXTRA=""                 # JSON merged into the chat body (provider quirks)
-CHAT_SYSTEM="You are a helpful voice assistant on a small gadget. Reply in the user's language. Be concise: one to three short sentences."
+CHAT_SYSTEM="You are a helpful voice assistant on a small gadget. Reply in the user's language. Answer with ONE short sentence of at most 15 characters: it is spoken aloud, so brevity matters. You cannot take actions or set reminders; only chat."
 TTS_CA="OPENAI_CA"; BRAIN_CA="OPENAI_CA"
 
 case "$PRESET" in
@@ -56,14 +57,15 @@ case "$PRESET" in
     TTS_KEY="$KEY"; CHAT_KEY="$KEY"
     ;;
   quicksilver)
-    echo "== preset: QuickSilver (deepseek chat, whisper STT, chatterbox/qwen3 TTS)"
+    echo "== preset: QuickSilver (qwen flash chat, whisper STT, chatterbox/qwen3 TTS)"
     TTS_URL="https://api.quicksilverpro.io/v1/audio/speech"
     TTS_MODEL="chatterbox-turbo"; TTS_VOICE=""
     TTS_MODEL_CJK="qwen3-tts"     # Chinese turns; chatterbox is English-first
     STT_URL="https://api.quicksilverpro.io/v1/audio/transcriptions"
     STT_MODEL="whisper-large-v3-turbo"
+    STT_ADPCM=1                                # IMA ADPCM WAV: ~4x less upload data
     CHAT_URL="https://api.quicksilverpro.io/v1"
-    CHAT_MODEL="deepseek-v4.1-flash"
+    CHAT_MODEL="qwen3.7-flash"
     # escaped for embedding in the C string: {"reasoning":{"exclude":true}}
     CHAT_EXTRA='{\"reasoning\":{\"exclude\":true}}'   # skip its thinking phase
     TTS_CA="ISRG_CA"; BRAIN_CA="ISRG_CA"
@@ -141,6 +143,8 @@ cat > esp32/components/muse/provider_config.h <<EOF
 /* --- Transcription (voice note -> text) --- */
 #define BRAIN_STT_URL   "$STT_URL"
 #define BRAIN_STT_MODEL "$STT_MODEL"
+/* 1: 4-bit IMA ADPCM WAV; 0: 16-bit PCM WAV for maximum compatibility. */
+#define BRAIN_STT_WAV_ADPCM $STT_ADPCM
 /* Whisper hallucinates a language on short notes; pin it (ISO 639-1) and
  * nudge it with a prompt in that language. "auto" sends neither field. */
 #define BRAIN_STT_LANG   "$STT_LANG"

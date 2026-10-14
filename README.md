@@ -31,7 +31,7 @@ esp32-thinks flips that. The device runs **your** stack: pick the cheapest trans
 - **Wake word + button** — say "Hi, ESP" (esp-sr WakeNet10, runs on-chip) or hold the knob; both start a turn. Wake turns end on a voice-activity timer; the button works exactly like before.
 - **Bring your own brain** — three independent OpenAI-compatible endpoints (STT / chat / TTS) in one config file. Mix providers freely; presets: `openai`, `quicksilver`, `custom`.
 - **Streaming voice replies** — the chat stream is parsed at sentence boundaries (ASCII + CJK); each sentence is synthesized the moment it lands and appended to the audio already playing. First word arrives while the model is still generating.
-- **Warm and fast** — persistent TLS sessions; a warm voice turn is **≈ 5–7 s** end-to-end, text caption at ~2–3 s.
+- **Faster answers** — voice reply starts **≈ 3.4 s after recording**, typed turns finish **2.2–2.6 s**. Connections prepare after Wi-Fi is ready; [v0.2.4 receipts](docs/LATENCY-v0.2.4.md) include first-after-boot and warm samples.
 - **Language-aware voice** — Chinese turns can use a different (better) TTS model than English ones, picked automatically from the transcript.
 - **Headless provisioning** — put your Wi-Fi in the config; the device self-provisions on boot. No app, no BLE dance, no vendor account needed.
 - **Silence-trimmed uploads** — recordings are trimmed to speech before upload, shaving ~0.5 s off transcription.
@@ -45,7 +45,7 @@ esp32-thinks flips that. The device runs **your** stack: pick the cheapest trans
 | Base firmware | [muse-gadget-sdk](https://github.com/facebookincubator/muse-gadget-sdk) @ `812c46f` (2026-10-09) + `patches/muse-brain.patch` (see [what's theirs, what's ours](#built-on-muse-gadget-sdk)) |
 | ESP-IDF | v6.0.1 (esp32s3 target) |
 | Brain | Any OpenAI-compatible servers: STT (`/audio/transcriptions`), chat (`/chat/completions`, SSE streaming), speech (`/audio/speech`) |
-| Presets | `openai` (all three) · `quicksilver` (deepseek-v4.1-flash + whisper-large-v3-turbo + chatterbox/qwen3-tts) · `custom` |
+| Presets | `openai` (all three) · `quicksilver` (qwen3.7-flash + whisper-large-v3-turbo + chatterbox/qwen3-tts) · `custom` |
 | Wake word | esp-sr WakeNet10 `wn10_hiesp` ("Hi, ESP", on-chip, `model` flash partition) — custom phrases trainable via Espressif's TTS Pipeline V3 |
 | Cost | ~fractions of a cent per reply (QuickSilver TTS $1.5–25/1M chars, OpenAI $15/1M) |
 | Build host | Linux or macOS with ESP-IDF v6.x |
@@ -84,7 +84,7 @@ Credit where it's due — and clarity about the split:
 
 **Theirs** (upstream, untouched behavior): the device framework, LVGL UI and round-LCD drivers, audio stack (codec, resampler, minimp3), input/console plumbing, OTA and partitioning. This recipe targets the SDK at a pinned commit so patches apply cleanly.
 
-**Ours** (`patches/muse-brain.patch`, ~1,600 lines): the brain session (`muse_chat_session.cpp` — three-endpoint config, SSE sentence streaming, TTS pipeline, keep-alive TLS), the wake-word integration (`muse_voice.c` — direct WakeNet10 on idle chunks, wake→PTT synthesis, VAD end-of-turn, cooldown), the `model` flash partition and the esp-dl kernel fix, plus the tooling (`apply.sh`, `build-and-flash.sh`, NVS backup, probes).
+**Ours** (`patches/muse-brain.patch`): the brain session (`muse_chat_session.cpp` — three-endpoint config, SSE sentence streaming, TTS pipeline, keep-alive TLS), the wake-word integration (`muse_voice.c` — direct WakeNet10 on idle chunks, wake→PTT synthesis, VAD end-of-turn, cooldown), the `model` flash partition and the esp-dl kernel fix, plus the tooling (`apply.sh`, `build-and-flash.sh`, NVS backup, probes).
 
 Nothing else from the Muse cloud is required: the vendor agent works as an optional fallback (its token is optional), and with headless provisioning the device never contacts it.
 
@@ -96,6 +96,7 @@ Everything lives in `esp32/components/muse/provider_config.h` (written by `apply
 |---|---|
 | `TTS_URL` / `TTS_MODEL` / `TTS_VOICE` | Speech endpoint, model, voice |
 | `TTS_MODEL_CJK` | Optional second speech model, auto-selected for Chinese turns |
+| `BRAIN_STT_WAV_ADPCM` | `1` uploads IMA ADPCM WAV at about one quarter of PCM size; enabled for the verified QuickSilver preset, `0` for other presets |
 | `TTS_API_KEY` / `TTS_CA` | Its key and pinned root (`OPENAI_CA` or `ISRG_CA`) |
 | `BRAIN_STT_URL` / `BRAIN_STT_MODEL` | Transcription endpoint (shares the chat key) |
 | `BRAIN_CHAT_URL` / `BRAIN_CHAT_KEY` / `BRAIN_MODEL` | Chat endpoint; leave the URL empty to use the Muse cloud agent |
@@ -113,7 +114,7 @@ Changed a define? Re-run `./build-and-flash.sh` — it rebuilds and reflashes.
 2. **You stop talking** → the recording is trimmed to speech and POSTed as multipart WAV to the transcription endpoint (keep-alive).
 3. **The transcript opens an SSE chat stream** → the parser splits the reply at sentence boundaries (`.!?` and CJK `。！？…`), so Chinese works too.
 4. **Each sentence POSTs to the speech endpoint** → the MP3 is appended to the audio buffer already being decoded and played. A reserved message slot lets captions and speech interleave with the stream.
-5. **Both TLS connections stay open** for the next turn; the first turn after boot pays one handshake each (~1.5 s), the rest pay none.
+5. **Completed short replies reuse the chat connection for speech** when provider origin and root trust match. Replies up to 128 UTF-8 bytes are synthesized together; longer replies stream on a separate speech connection. A HEAD request prepares the first TLS connection after Wi-Fi is ready, and before a voice recording when needed. Clients retain keep-alive connections and save TLS 1.3 tickets after reading headers, so an idle-close reconnect can resume the session.
 
 Latency receipts (warm, measured on device, QuickSilver preset): transcription 3.4 s, first spoken word ≈ 5–7 s after you stop; the text caption shows at ~2–3 s. Cold adds ~1.5 s. See [REFERENCE](docs/REFERENCE.md) for the full breakdown and every gotcha.
 

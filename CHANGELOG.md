@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.2.4 — 2026-10-14 — faster voice turns, correct HTTP reuse
+
+The Watcher now answers in **about 3.4 s after recording ends**, including the first turn after a fresh boot with connection preparation enabled. Typed turns finish in **2.2–2.6 s** (first after boot: **2.5 s**), down from the previous 5.1–5.6 s. [Measurements and conditions](docs/LATENCY-v0.2.4.md).
+
+- **Correct keep-alive** — chat SSE is parsed in `perform()`'s data callback. IDF 6's manual `open()` path created a new TLS connection each turn. Short replies (up to 128 UTF-8 bytes, including short multi-sentence greetings) use the completed chat connection for one TTS request; longer replies continue sentence streaming on a separate client.
+- **Prepare the first connection** — a HEAD request runs after Wi-Fi and board initialization, and before recording when needed. It establishes verified TLS without running a model; the transcription endpoint's 405 response keeps the connection usable. TLS 1.3 tickets are saved after headers arrive, scoped to the provider origin; an empty response or idle-close gets one retry before any reply data has started. A forced Wi-Fi reconnect resumed TLS in 480 ms during profiling.
+- **Faster certificate checks** — the Let's Encrypt bundle adds the official [Root YE](https://letsencrypt.org/certificates/) alongside X1, shortening the current server chain; fixed-point EC tables accelerate signature verification. Profiling with wake disabled measured fresh handshakes at about 1.6–1.9 s; first-connection work is now prepared before the question. Server certificate and hostname verification remain enabled.
+- **About 4× less STT upload** — `BRAIN_STT_WAV_ADPCM` uses the SDK's existing IMA encoder inside a standard WAV container, with no codec heap allocation. QuickSilver opts in; OpenAI/custom presets keep PCM by default. The firmware encoder's English and Chinese samples were accepted by the server; the Chinese transcript matched PCM exactly. HTTP buffers use PSRAM on equipped boards, and small requests disable Nagle's delay.
+- **Finish completed brain replies immediately** — skip the generic 3 s quiet interval once HTTP and speech are complete; Muse cloud turns retain their follow-up interval. The QuickSilver preset uses `qwen3.7-flash`, with a concise voice prompt.
+- **Meaningful `k` self-test** — preserve the microphone samples captured during the embedded wake phrase, then use the ordinary recording tail. Previously the self-test discarded its own phrase and uploaded subsequent room noise. Normal PTT and wake VAD keep their existing behavior.
+- **Production cleanup** — remove `lat:` probes and mbedTLS debug; resting Wi-Fi uses MIN_MODEM and active turns restore the previous setting. Keep a balanced CPU maximum-frequency lock during turns. The zero-allocation coroner and 360 s recovery for existing DMA stalls remain enabled.
+- **Validation** — Watcher (wake enabled) and AIPI (wake disabled) builds pass; 246 host tests complete with 2 environment-dependent skips, plus all 5 audio format/FFmpeg decoder checks on macOS. Final patch applies through `apply.sh` to a clean SDK at `812c46f`. On-device cold/warm typed, voice, boot and disconnect recovery checks pass.
+
 ## v0.2.3 — 2026-10-14 — watchdog + coroner: the wedge leaves evidence
 
 The v0.2.2 known issue (device wedges after 1–6 h, buttons dead, `k`/`l` silent) now leaves evidence instead of silence. Two freezes were caught in the act; both showed the same signature: `muse_voice` blocked, `lvgl` spinning in `lv_refr_wait_for_flushing` — the display flush never completes, so the LVGL lock is never released and the voice task dies updating its caption.

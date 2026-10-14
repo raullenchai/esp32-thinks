@@ -1,15 +1,31 @@
 diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
-index c3e7013..1d340e2 100644
+index c3e7013..0d383df 100644
 --- a/esp32/components/muse/CMakeLists.txt
 +++ b/esp32/components/muse/CMakeLists.txt
-@@ -111,17 +111,21 @@ elseif(CONFIG_HOMEHUB_VOICE)
+@@ -43,7 +43,7 @@ if(CONFIG_MUSE_ENABLED)
+         "muse_link.c"
+         "muse_ble.c")
+     if(CONFIG_MUSE_HATCH)
+-        list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp")
++        list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_brain_audio.c")
+         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
+     else()
+         list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
+@@ -106,22 +106,26 @@ if(CONFIG_MUSE_ENABLED)
+ elseif(CONFIG_HOMEHUB_VOICE)
+     # The Voice PE board uses just the Hatch voice session; the project's main/
+     # voice_muse_chat.c stands in for the Muse settings, Wi-Fi and Link hooks.
+-    list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_chat_text.c" "muse_text.c")
++    list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_brain_audio.c" "muse_adpcm.c" "muse_chat_text.c" "muse_text.c")
+     list(APPEND embed "test_reply.mp3")
  endif()
  
  set(muse_priv_requires
 -    esp_timer esp_driver_usb_serial_jtag esp_psram nvs_flash
+-    bt esp-tls mbedtls esp_app_format esp_http_client
 +    esp_system
 +    esp_timer esp_driver_usb_serial_jtag esp_psram nvs_flash xtensa
-     bt esp-tls mbedtls esp_app_format esp_http_client
++    bt esp-tls mbedtls esp_app_format esp_http_client tcp_transport
      noise_core minimp3
      esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi
 -    esp_driver_pcnt)
@@ -65,19 +81,126 @@ index d5cfdec..5a25ddc 100644
    espressif/cjson: "~1.7"
    lvgl/lvgl:
      version: "9.5.0"
+diff --git a/esp32/components/muse/muse_brain_audio.c b/esp32/components/muse/muse_brain_audio.c
+new file mode 100644
+index 0000000..9b92d2b
+--- /dev/null
++++ b/esp32/components/muse/muse_brain_audio.c
+@@ -0,0 +1,60 @@
++/* Copyright (c) Meta Platforms, Inc. and affiliates.
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "muse_brain_audio.h"
++#include "muse_adpcm.h"
++#include <string.h>
++
++static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | (uint16_t)p[1] << 8); }
++static uint32_t get32(const uint8_t *p) { return get16(p) | (uint32_t)get16(p + 2) << 16; }
++static void put16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
++static void put32(uint8_t *p, uint32_t v) { put16(p, v); put16(p + 2, v >> 16); }
++
++size_t muse_brain_wav_adpcm(uint8_t *out, size_t cap, const uint8_t *wav, size_t len)
++{
++    enum { PCM_HDR = 44, HDR = 60, BLOCK = 256, SAMPLES = 505, RATE = 16000 };
++    if (!out || !wav || cap < HDR || len <= PCM_HDR || (len - PCM_HDR) % 2 ||
++        memcmp(wav, "RIFF", 4) || memcmp(wav + 8, "WAVEfmt ", 8) ||
++        memcmp(wav + 36, "data", 4) || get32(wav + 16) != 16 ||
++        get16(wav + 20) != 1 || get16(wav + 22) != 1 ||
++        get32(wav + 24) != RATE || get16(wav + 32) != 2 || get16(wav + 34) != 16) {
++        return 0;
++    }
++    size_t n = (len - PCM_HDR) / 2;
++    size_t blocks = (n + SAMPLES - 1) / SAMPLES;
++    if (n > UINT32_MAX || blocks > (cap - HDR) / BLOCK || blocks > (UINT32_MAX - HDR) / BLOCK) {
++        return 0;
++    }
++    size_t bytes = blocks * BLOCK;
++    memset(out, 0, HDR);
++    memcpy(out, "RIFF", 4); put32(out + 4, HDR + bytes - 8);
++    memcpy(out + 8, "WAVEfmt ", 8); put32(out + 16, 20);
++    put16(out + 20, 0x11); put16(out + 22, 1);
++    put32(out + 24, RATE); put32(out + 28, RATE * BLOCK / SAMPLES);
++    put16(out + 32, BLOCK); put16(out + 34, 4);
++    put16(out + 36, 2); put16(out + 38, SAMPLES);
++    memcpy(out + 40, "fact", 4); put32(out + 44, 4); put32(out + 48, n);
++    memcpy(out + 52, "data", 4); put32(out + 56, bytes);
++    const uint8_t *pcm = wav + PCM_HDR;
++    muse_adpcm_t state = {0};
++    int16_t block[SAMPLES - 1];
++    for (size_t i = 0; i < blocks; i++) {
++        size_t at = i * SAMPLES;
++        uint8_t *p = out + HDR + i * BLOCK;
++        state.pred = (int16_t)get16(pcm + 2 * at);
++        put16(p, (uint16_t)state.pred); p[2] = state.index; p[3] = 0;
++        for (size_t j = 0; j < SAMPLES - 1; j++) {
++            size_t sample = at + 1 + j;
++            block[j] = (int16_t)get16(pcm + 2 * (sample < n ? sample : n - 1));
++        }
++        muse_adpcm_encode_block(&state, block, SAMPLES - 1, p + 4);
++    }
++    return HDR + bytes;
++}
+diff --git a/esp32/components/muse/muse_brain_audio.h b/esp32/components/muse/muse_brain_audio.h
+new file mode 100644
+index 0000000..d3d02a9
+--- /dev/null
++++ b/esp32/components/muse/muse_brain_audio.h
+@@ -0,0 +1,23 @@
++/* Copyright (c) Meta Platforms, Inc. and affiliates.
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* Convert the gadget's 44-byte, 16-kHz mono PCM WAV to IMA ADPCM WAV.
++ * Buffers must not overlap. Returns the file size, or 0 for invalid input or
++ * insufficient room. The fact chunk preserves the unpadded sample count. */
++size_t muse_brain_wav_adpcm(uint8_t *out, size_t cap, const uint8_t *wav, size_t len);
++#ifdef __cplusplus
++}
++#endif
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index a6ad810..101d6dc 100644
+index a6ad810..925f095 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
-@@ -52,6 +52,7 @@
+@@ -52,7 +52,11 @@
  #include "esp_attr.h"
  #include "esp_crt_bundle.h"
  #include "esp_heap_caps.h"
 +#include "esp_http_client.h"
++#include "esp_transport.h"
++#include "esp_transport_ssl.h"
  #include "esp_log.h"
++#include "esp_pm.h"
  #include "esp_random.h"
  #include "esp_timer.h"
-@@ -101,6 +102,28 @@ static const char *TAG = "muse_chat_session";
+ #include "esp_tls.h"
+@@ -72,6 +76,7 @@ extern "C" {
+ #include "muse_wifi.h"
+ }
+ #include "muse_chat_priv.h"
++#include "muse_brain_audio.h"
+ 
+ #include <xplat/noise/core/ClientSession.h>
+ #include <xplat/noise/core/PsaCryptoBackend.h>
+@@ -101,6 +106,29 @@ static const char *TAG = "muse_chat_session";
  #define TEXT_MAX 1024                      /* a message's text, for captions timed to its speech */
  #define SPEECH_CHARS_PER_S 14              /* until the speech's length is known */
  #define TEXT_CHARS_PER_S 16                /* speaker off: reading pace, a little over speech */
@@ -101,12 +224,13 @@ index a6ad810..101d6dc 100644
 +static char *s_http_sink;             /* HTTP response accumulator */
 +static size_t s_http_sink_len;
 +
++static void brain_http_warmup(void);
 +static void brain_voice_reply(void);
 +static void brain_text_turn(const char *text);
  #define TEXT_HOLD_S 2                      /* speaker off: how long a message's last lines stay up */
  
  #define PING_US (20 * 1000000LL)
-@@ -168,6 +191,7 @@ static char s_host[MUSE_HOST_MAX + 1];
+@@ -168,6 +196,7 @@ static char s_host[MUSE_HOST_MAX + 1];
  /* When to connect without a turn asking: once Wi-Fi is up, again with backoff
   * if that fails or the connection drops, not after an idle close. */
  static int64_t s_auto_next_us;
@@ -114,7 +238,47 @@ index a6ad810..101d6dc 100644
  static int64_t s_auto_backoff_us = AUTO_RETRY_MIN_US;
  
  /* ---- Streams on the connection ---- */
-@@ -1006,7 +1030,7 @@ static bool turn_start(uint32_t gen, bool text)
+@@ -254,6 +283,27 @@ EXT_RAM_BSS_ATTR static turn_t s_turn;
+ enum mark_t : uint8_t { M_RELEASE, M_SENT, M_ACK, M_TEXT, M_DONE, M_TTS, M_MP3, M_AUDIO, M_COUNT };
+ static const char *const MARK_NAMES[M_COUNT] = { "release", "sent", "ack", "text", "done", "tts", "mp3", "audio" };
+ static int64_t s_marks[M_COUNT];
++/* The input task drops the CPU to the crystal clock when the device rests
++ * (dark + asleep); a turn must never run there -- TLS alone costs seconds. */
++#if CONFIG_PM_ENABLE
++static esp_pm_lock_handle_t s_speed;
++static bool s_speed_held;
++#endif
++static void turn_speed(bool on)
++{
++#if CONFIG_PM_ENABLE
++    if (on == s_speed_held) {
++        return;
++    }
++    if (!s_speed && esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "brain", &s_speed) != ESP_OK) {
++        return;
++    }
++    esp_err_t err = on ? esp_pm_lock_acquire(s_speed) : esp_pm_lock_release(s_speed);
++    if (err == ESP_OK) {
++        s_speed_held = on;
++    }
++#endif
++}
+ static char s_reply_shown[EV_TEXT];   /* the pre-speech caption last sent */
+ 
+ static void mark(mark_t m);
+@@ -953,6 +1003,7 @@ static void turn_reset_streams(void)
+ 
+ static void turn_finish(void)
+ {
++    turn_speed(false);
+     turn_reset_streams();
+     s_turn.phase = P_IDLE;
+     s_turn.dict_id = s_turn.chat_id = 0;
+@@ -1003,10 +1054,11 @@ static bool turn_start(uint32_t gen, bool text)
+     s_turn.text = text;
+     s_turn.tts_msg = -1;
+     memset(s_marks, 0, sizeof(s_marks));
++    turn_speed(true);
      s_reply_shown[0] = '\0';
      s_turn.start_us = now_us();
      resampler_init(&s_turn.up, MIC_RATE, DICT_RATE);
@@ -123,7 +287,7 @@ index a6ad810..101d6dc 100644
          turn_fail(muse_hatch_configured() ? "CAN'T REACH MUSE" : "MUSE NOT SET UP");
          return false;
      }
-@@ -1019,6 +1043,13 @@ static void turn_begin(uint32_t gen)
+@@ -1019,6 +1071,14 @@ static void turn_begin(uint32_t gen)
          return;
      }
      if (VOICE_NOTE) {
@@ -132,12 +296,13 @@ index a6ad810..101d6dc 100644
 +            s_brain_note_len = MUSE_HATCH_WAV_HEADER;
 +            s_turn.pcm_bytes = 0;
 +            s_turn.phase = P_LISTEN;
++            brain_http_warmup();
 +            return;
 +        }
          if (!open_note()) {
              disconnect("chat open failed");
              turn_fail("CAN'T REACH MUSE");
-@@ -1131,6 +1162,24 @@ static bool open_note(void)
+@@ -1131,6 +1191,24 @@ static bool open_note(void)
  /* Moves the mic into the note request; on release, sends the rest and waits for the reply. */
  static bool record_note(void)
  {
@@ -162,7 +327,7 @@ index a6ad810..101d6dc 100644
      for (;;) {
          size_t room = NOTE_PART_BYTES - s_turn.note_len;
          size_t left = NOTE_MAX_BYTES - s_turn.pcm_bytes;
-@@ -1171,6 +1220,10 @@ static bool record_note(void)
+@@ -1171,6 +1249,10 @@ static bool record_note(void)
   */
  static void send_chat(const char *text, const char *modality)
  {
@@ -173,7 +338,7 @@ index a6ad810..101d6dc 100644
      s_turn.chat_posted = true;
      cJSON *body = cJSON_CreateObject();
      cJSON_AddStringToObject(body, "message", text);
-@@ -1220,14 +1273,17 @@ static void post_chat(const char *text)
+@@ -1220,14 +1302,18 @@ static void post_chat(const char *text)
  /* A typed turn: the text goes straight to the chat. */
  static void text_begin(const char *text)
  {
@@ -181,6 +346,7 @@ index a6ad810..101d6dc 100644
 +    if (!turn_start(++s_gen, true)) {
          return;
      }
++    mark(M_RELEASE);
      ESP_LOGI(TAG, "typed turn: %u bytes", (unsigned)strlen(text));
      send_chat(text, "text");
      if (s_turn.phase == P_WAIT_REPLY) {
@@ -193,7 +359,7 @@ index a6ad810..101d6dc 100644
      }
  }
  
-@@ -1382,6 +1438,17 @@ static void message_done(int i, const char *final_text)
+@@ -1382,6 +1468,17 @@ static void message_done(int i, const char *final_text)
          if (final_text && final_text[0] && strlen(final_text) != m.len) {
              n = strlen(final_text);
              muse_hatch_console("final", final_text, "\"msg\":%d", i);
@@ -211,7 +377,7 @@ index a6ad810..101d6dc 100644
          }
          muse_hatch_console("message_done", nullptr, "\"msg\":%d,\"bytes\":%u", i, (unsigned)n);
          ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)n);
-@@ -1499,6 +1566,611 @@ static void on_chat_ack(stream_t *s)
+@@ -1499,6 +1596,756 @@ static void on_chat_ack(stream_t *s)
      emit(MUSE_HATCH_EV_SENT, nullptr);
  }
  
@@ -237,19 +403,111 @@ index a6ad810..101d6dc 100644
 +    return TTS_MODEL;
 +}
 +
-+/* Two persistent TLS sessions: one for STT + chat, one for TTS -- a voice
-+ * turn speaks sentences while the chat stream is still open, so they cannot
-+ * share a connection. A fresh TCP+TLS handshake costs ~1 s here. */
++/* Persistent HTTPS clients: STT + chat can share their client; streaming
++ * multi-sentence replies use a separate speech client. A completed short
++ * reply can reuse the chat socket for speech when origin and trust match. */
 +static esp_http_client_handle_t s_openai_cli;
 +static esp_http_client_handle_t s_tts_cli;
++
++/* A completed short chat reply can speak on the same authenticated socket.
++ * Match the full authority (including port); distinct providers keep separate
++ * clients and streaming multi-sentence replies keep their speech connection. */
++static bool same_https_origin(const char *a, const char *b)
++{
++    if (strncmp(a, "https://", 8) || strncmp(b, "https://", 8)) {
++        return false;
++    }
++    size_t alen = strcspn(a + 8, "/?#");
++    size_t blen = strcspn(b + 8, "/?#");
++    return alen && alen == blen && !strncmp(a + 8, b + 8, alen);
++}
++
++static bool brain_share_speech(void)
++{
++    return same_https_origin(BRAIN_CHAT_URL, TTS_URL) &&
++           !strcmp((const char *)BRAIN_CA, (const char *)TTS_CA);
++}
++/* Own the SSL transports so post-handshake TLS 1.3 tickets can be saved
++ * after reading headers. IDF's automatic save occurs before tickets arrive. */
++struct brain_transport_t {
++    esp_transport_handle_t handle;
++    char origin[256];
++    bool ticket_valid, ticket_stale;
++};
++static brain_transport_t s_brain_transport, s_speech_transport;
++
++static brain_transport_t &http_transport(esp_http_client_handle_t *cli)
++{
++    return cli == &s_openai_cli ? s_brain_transport : s_speech_transport;
++}
++
++static void http_discard(esp_http_client_handle_t *cli)
++{
++    if (*cli) {
++        esp_http_client_cleanup(*cli);
++        *cli = nullptr;
++    }
++    brain_transport_t &transport = http_transport(cli);
++    if (transport.handle) {
++        esp_transport_destroy(transport.handle);
++        transport.handle = nullptr;
++    }
++    transport.origin[0] = '\0';
++    transport.ticket_valid = transport.ticket_stale = false;
++}
++
++static void http_save_ticket(esp_http_client_handle_t client)
++{
++    brain_transport_t &transport = http_transport(
++        client == s_openai_cli ? &s_openai_cli : &s_tts_cli);
++#if CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
++    if (transport.handle) {
++        esp_transport_ssl_session_ticket_operation(transport.handle, ESP_TRANSPORT_SESSION_TICKET_SAVE);
++        bool valid = esp_transport_ssl_session_ticket_operation(
++            transport.handle, ESP_TRANSPORT_SESSION_TICKET_USE) == ESP_OK;
++        /* SAVE may replace a previous ticket with NULL. The public USE
++         * API then leaves cfg.client_session unchanged; discard this
++         * transport before its next request so that pointer stays safe. */
++        transport.ticket_stale = !valid && (transport.ticket_valid || transport.ticket_stale);
++        transport.ticket_valid = valid;
++    }
++#endif
++}
++
++struct brain_stream_t {
++    char *reply;
++    size_t replysz;
++    char line[1536], pend[1024];
++    size_t llen, plen;
++    bool done, share_speech;
++};
++static brain_stream_t *s_brain_stream;
++static void brain_chat_data(const char *data, size_t len);
++
 +static bool s_tts_overflow;   /* the MP3 buffer overflowed: speech was lost */
 +static bool s_tts_first;      /* the next TTS response chunk is the first one */
 +static size_t s_tts_skip;     /* ID3 tag bytes still to skip (the tag can span chunks) */
 +
 +static esp_err_t openai_http_event(esp_http_client_event_t *evt)
 +{
++    if (evt->event_id == HTTP_EVENT_ON_CONNECTED && evt->client) {
++        /* Headers and the small chat/TTS body are separate writes. Let the
++         * body leave immediately rather than waiting for a delayed ACK. */
++        int fd = esp_http_client_get_socket(evt->client);
++        int on = 1;
++        if (fd >= 0) {
++            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
++        }
++    }
++    if (evt->event_id == HTTP_EVENT_ON_HEADERS_COMPLETE && evt->client) {
++        http_save_ticket(evt->client);
++    }
 +    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->client &&
 +        esp_http_client_get_status_code(evt->client) == 200) {
++        if (evt->client == s_openai_cli && s_brain_stream) {
++            brain_chat_data((const char *)evt->data, evt->data_len);
++            return ESP_OK;
++        }
 +        if (evt->user_data) {
 +            const uint8_t *d = (const uint8_t *)evt->data;
 +            size_t len = evt->data_len;
@@ -293,36 +551,99 @@ index a6ad810..101d6dc 100644
 +
 +/* POSTs on a kept-alive connection; a failed one is dropped and re-made next call. */
 +static bool http_post(esp_http_client_handle_t *cli, void *tag, const char *url, const char *key,
-+                      const char *content_type, const char *body, size_t len)
++                      const char *content_type, const char *body, size_t len, bool warmup = false)
 +{
++    brain_transport_t &transport = http_transport(cli);
++    size_t origin_len = strcspn(url + (strncmp(url, "https://", 8) ? 0 : 8), "/?#") + 8;
++    if (strncmp(url, "https://", 8) || origin_len >= sizeof(transport.origin)) {
++        ESP_LOGE(TAG, "brain: invalid HTTPS origin");
++        return false;
++    }
++    /* Session tickets belong to one origin. Independent STT/chat endpoints
++     * must never offer one provider another provider's ticket. */
++    if (*cli && (transport.ticket_stale || !same_https_origin(transport.origin, url))) {
++        http_discard(cli);
++    }
 +    if (!*cli) {
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++        transport.handle = esp_transport_ssl_init();
++        if (!transport.handle) {
++            return false;
++        }
++#endif
++        memcpy(transport.origin, url, origin_len);
++        transport.origin[origin_len] = '\0';
++        const char *ca = (const char *)(tag ? TTS_CA : BRAIN_CA);
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++        esp_transport_set_default_port(transport.handle, 443);
++        esp_transport_ssl_set_cert_data(transport.handle, ca, strlen(ca));
++#endif
 +        esp_http_client_config_t cfg = {};
 +        cfg.url = url;
 +        cfg.method = HTTP_METHOD_POST;
-+        cfg.cert_pem = (const char *)(tag ? TTS_CA : BRAIN_CA);
++        cfg.cert_pem = ca;
 +        cfg.timeout_ms = 30000;
++        /* Exceed ALWAYSINTERNAL so HTTP buffers live in PSRAM, leaving
++         * internal memory for the audio drivers and Wi-Fi while WakeNet runs. */
++#if CONFIG_SPIRAM
++        int buffer_size = CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL >= 8192 ?
++                          CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL + 1 : 8192;
++        cfg.buffer_size = buffer_size;
++        cfg.buffer_size_tx = buffer_size;
++#endif
 +        cfg.event_handler = openai_http_event;
 +        cfg.user_data = tag;
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++        cfg.transport = transport.handle;
++#endif
++        cfg.disable_auto_redirect = true;
 +        *cli = esp_http_client_init(&cfg);
 +        if (!*cli) {
++            http_discard(cli);
 +            ESP_LOGE(TAG, "openai: init failed");
 +            return false;
 +        }
 +    }
 +    s_http_sink_len = 0;
 +    esp_http_client_set_url(*cli, url);
++    esp_http_client_set_method(*cli, warmup ? HTTP_METHOD_HEAD : HTTP_METHOD_POST);
++    esp_http_client_set_user_data(*cli, tag);
 +    char auth[256];
 +    snprintf(auth, sizeof(auth), "Bearer %s", key);
 +    esp_http_client_set_header(*cli, "Authorization", auth);
 +    esp_http_client_set_header(*cli, "Content-Type", content_type);
 +    esp_http_client_set_post_field(*cli, body, len);
++    uint32_t audio_before = s_tts_bytes_total;
 +    esp_err_t err = esp_http_client_perform(*cli);
 +    int status = esp_http_client_get_status_code(*cli);
-+    bool ok = err == ESP_OK && status == 200;
++    bool empty = tag ? s_tts_bytes_total == audio_before :
++                 (s_brain_stream ? !s_brain_stream->reply[0] : !s_http_sink_len);
++    if (!warmup && empty && (err != ESP_OK || status == 200)) {
++        /* A keep-alive FIN can surface as an empty 200. close() resets HTTP
++         * state while retaining this origin's ticket for the reconnect. */
++        if (transport.ticket_stale) {
++            /* Leave recovery to a fresh request if no usable ticket remains. */
++            http_discard(cli);
++            return false;
++        }
++        if (s_brain_stream && !tag) {
++            s_brain_stream->llen = s_brain_stream->plen = 0;
++            s_brain_stream->done = false;
++        }
++        if (tag) {
++            s_tts_first = true;
++            s_tts_skip = 0;
++        }
++        esp_http_client_close(*cli);
++        err = esp_http_client_perform(*cli);
++        status = esp_http_client_get_status_code(*cli);
++        empty = tag ? s_tts_bytes_total == audio_before :
++                (s_brain_stream ? !s_brain_stream->reply[0] : !s_http_sink_len);
++    }
++    bool ok = err == ESP_OK && (warmup || (status == 200 && !empty));
 +    if (!ok) {
 +        ESP_LOGE(TAG, "openai %s: err %s status %d sink %u", url, esp_err_to_name(err), status, (unsigned)s_http_sink_len);
-+        esp_http_client_cleanup(*cli);
-+        *cli = nullptr;
++        http_discard(cli);
 +    }
 +    if (ok && s_http_sink) {
 +        s_http_sink[s_http_sink_len] = '\0';
@@ -337,6 +658,18 @@ index a6ad810..101d6dc 100644
 +    s_tts_skip = 0;
 +    return http_post(mode == 0 ? &s_tts_cli : &s_openai_cli, mode == 0 ? (void *)1 : nullptr,
 +                     url, key, content_type, body, len);
++}
++
++/* A HEAD request prepares TCP/TLS without running transcription or chat.
++ * A 405 is fine: its complete HTTP response leaves a reusable connection.
++ * All calls run on muse_chat's task, so the clients have a single owner. */
++static void brain_http_warmup(void)
++{
++    const char *url = BRAIN_STT_URL[0] ? BRAIN_STT_URL : BRAIN_CHAT_URL "/chat/completions";
++    if (s_openai_cli && same_https_origin(s_brain_transport.origin, url)) {
++        return;
++    }
++    http_post(&s_openai_cli, nullptr, url, BRAIN_CHAT_KEY, "application/json", "", 0, true);
 +}
 +
 +/* Streams one message MP3 from OpenAI into tts_data(); true on success. */
@@ -374,7 +707,8 @@ index a6ad810..101d6dc 100644
 +
 +/* One sentence, spoken while the chat stream is still writing the next one.
 + * Appends to the turn's MP3 buffer without resetting it (sentences share it). */
-+static bool tts_fetch_sentence(const char *text, size_t len)
++static bool tts_fetch_sentence(const char *text, size_t len,
++                               esp_http_client_handle_t *cli = &s_tts_cli)
 +{
 +    char say[1024];
 +    size_t j = 0;
@@ -411,9 +745,13 @@ index a6ad810..101d6dc 100644
 +    if (!body) {
 +        return false;
 +    }
++    mark(M_TTS);
 +    s_tts_first = true;
 +    s_tts_skip = 0;
-+    bool ok = http_post(&s_tts_cli, (void *)1, TTS_URL, TTS_API_KEY, "application/json", body, strlen(body));
++    bool ok = http_post(cli, (void *)1, TTS_URL, TTS_API_KEY, "application/json", body, strlen(body));
++    if (*cli && cli == &s_openai_cli) {
++        esp_http_client_set_user_data(*cli, nullptr);
++    }
 +    free(body);
 +    return ok;
 +}
@@ -423,21 +761,6 @@ index a6ad810..101d6dc 100644
 +#define BRAIN_HIST_MSGS 8             /* user/assistant entries kept in RAM */
 +#define BRAIN_HIST_LEN 512
 +#define BRAIN_BOUNDARY "esp32thinks7d3a"
-+
-+static esp_err_t brain_http_event(esp_http_client_event_t *evt)
-+{
-+    if (evt->event_id == HTTP_EVENT_ON_DATA && s_http_sink &&
-+        s_http_sink_len < BRAIN_SINK_BYTES - 1) {
-+        size_t room = BRAIN_SINK_BYTES - 1 - s_http_sink_len;
-+        size_t n = evt->data_len < room ? evt->data_len : room;
-+        memcpy(s_http_sink + s_http_sink_len, evt->data, n);
-+        s_http_sink_len += n;
-+    }
-+    return ESP_OK;
-+}
-+
-+/* One HTTPS POST; the response accumulates in s_http_sink. */
-+/* (brain HTTP now goes through openai_perform() above.) */
 +
 +/* Speech-to-text: multipart-uploads the staged WAV, returns the transcript. */
 +/* Trim leading/trailing near-silence from a 16-bit mono WAV in place. The
@@ -491,7 +814,19 @@ index a6ad810..101d6dc 100644
 +    size_t hlen = strlen(head), tlen = strlen(tail);
 +    len = wav_trim_silence((uint8_t *)wav, len);
 +    memcpy(s_brain_post, head, hlen);
-+    memcpy(s_brain_post + hlen, wav, len);
++    size_t audio_len = 0;
++#if defined(BRAIN_STT_WAV_ADPCM) && BRAIN_STT_WAV_ADPCM
++    /* The SDK's IMA encoder needs no new codec heap. WAV remains the API
++     * format, with about a quarter of the PCM upload bytes. Opt in only
++     * with a provider that has been verified to decode ADPCM WAV. */
++    audio_len = muse_brain_wav_adpcm(s_brain_post + hlen,
++                                   NOTE_MAX_BYTES + 1280 - hlen - tlen, wav, len);
++#endif
++    if (!audio_len) {
++        memcpy(s_brain_post + hlen, wav, len);
++        audio_len = len;
++    }
++    len = audio_len;
 +    memcpy(s_brain_post + hlen + len, tail, tlen);
 +    /* A reused keep-alive socket the server just closed yields a 0-byte 200;
 +     * retry once right away instead of punting to the slow note path. */
@@ -536,6 +871,105 @@ index a6ad810..101d6dc 100644
 +        }
 +        decode();
 +        vTaskDelay(pdMS_TO_TICKS(20));
++    }
++}
++
++static void brain_chat_data(const char *data, size_t len)
++{
++    brain_stream_t &ctx = *s_brain_stream;
++    char *reply = ctx.reply;
++    size_t replysz = ctx.replysz;
++    auto &line = ctx.line;
++    auto &pend = ctx.pend;
++    size_t &llen = ctx.llen, &plen = ctx.plen;
++    bool &done = ctx.done;
++    bool &share_speech = ctx.share_speech;
++    for (size_t i = 0; i < len && !done; i++) {
++        char c = data[i];
++        if (c != '\n') {
++            if (llen < sizeof(line) - 1) {
++                line[llen++] = c;
++            }
++            continue;
++        }
++        line[llen] = '\0';
++        llen = 0;
++        if (strncmp(line, "data: ", 6)) {
++            continue;
++        }
++        const char *s = line + 6;
++        if (!strcmp(s, "[DONE]")) {
++            done = true;
++            break;
++        }
++        cJSON *e = cJSON_Parse(s);
++        if (!e) {
++            continue;
++        }
++        cJSON *ch = cJSON_GetArrayItem(cJSON_GetObjectItem(e, "choices"), 0);
++        const char *delta = ch ? cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(ch, "delta"), "content")) : nullptr;
++        if (delta && delta[0]) {
++            strlcat(reply, delta, replysz);
++            const char *d = delta;
++            size_t dl = strlen(d);
++            while (dl > 0) {
++                if (plen + dl >= sizeof(pend) - 1) {
++                    if (plen > 0) {   /* flush first so nothing is dropped */
++                        brain_pump_audio();
++                        tts_fetch_sentence(pend, plen);
++                        plen = 0;
++                        pend[0] = '\0';
++                    }
++                    if (dl >= sizeof(pend) - 1) {   /* cut the delta at a UTF-8 boundary */
++                        size_t take = sizeof(pend) - 1;
++                        while (take > 0 && (((const unsigned char *)d)[take] & 0xC0) == 0x80) {
++                            take--;
++                        }
++                        memcpy(pend, d, take);
++                        plen = take;
++                        pend[plen] = '\0';
++                        brain_pump_audio();
++                        tts_fetch_sentence(pend, plen);
++                        plen = 0;
++                        pend[0] = '\0';
++                        d += take;
++                        dl -= take;
++                        continue;
++                    }
++                }
++                memcpy(pend + plen, d, dl);
++                plen += dl;
++                pend[plen] = '\0';
++                break;
++            }
++            /* Replies up to 128 UTF-8 bytes are a short burst, even when
++             * the model adds a greeting or a second tiny sentence. */
++            if (share_speech && plen >= 128) {
++                share_speech = false;
++            }
++            bool brk = plen >= sizeof(pend) - 8;   /* never let it wrap */
++            if (!brk && plen >= 2) {
++                unsigned char last = (unsigned char)pend[plen - 1];
++                brk = last == '.' || last == '!' || last == '?' || last == '\n';
++                if (!brk && plen >= 3) {
++                    const unsigned char *t = (const unsigned char *)pend + plen - 3;
++                    brk = (t[0] == 0xE3 && t[1] == 0x80 && t[2] == 0x82) ||   /* 。 */
++                          (t[0] == 0xEF && t[1] == 0xBC && t[2] == 0x81) ||   /* ！ */
++                          (t[0] == 0xEF && t[1] == 0xBC && t[2] == 0x9F) ||   /* ？ */
++                          (t[0] == 0xE2 && t[1] == 0x80 && t[2] == 0xA6);     /* … */
++                }
++            }
++            if (brk && plen >= 1) {
++                if (!share_speech) {
++                    brain_pump_audio();
++                    tts_fetch_sentence(pend, plen);
++                    plen = 0;
++                    pend[0] = '\0';
++                    share_speech = false;
++                }
++            }
++        }
++        cJSON_Delete(e);
 +    }
 +}
 +
@@ -584,150 +1018,27 @@ index a6ad810..101d6dc 100644
 +        return false;
 +    }
 +
-+    if (!s_openai_cli) {
-+        esp_http_client_config_t cfg = {};
-+        cfg.url = BRAIN_CHAT_URL;
-+        cfg.method = HTTP_METHOD_POST;
-+        cfg.cert_pem = (const char *)BRAIN_CA;
-+        cfg.timeout_ms = 30000;
-+        cfg.event_handler = openai_http_event;
-+        cfg.user_data = nullptr;
-+        s_openai_cli = esp_http_client_init(&cfg);
-+        if (!s_openai_cli) {
-+            cJSON_free(json);
-+            return false;
-+        }
-+    }
 +    s_tts_bytes_total = 0;
 +    s_tts_overflow = false;
 +    reply[0] = '\0';
-+    bool ok = false;
-+    size_t blen = strlen(json);
-+    if (esp_http_client_set_url(s_openai_cli, BRAIN_CHAT_URL "/chat/completions") == ESP_OK &&
-+        esp_http_client_set_method(s_openai_cli, HTTP_METHOD_POST) == ESP_OK) {
-+        char auth[256];
-+        snprintf(auth, sizeof(auth), "Bearer %s", BRAIN_CHAT_KEY);
-+        esp_http_client_set_header(s_openai_cli, "Authorization", auth);
-+        esp_http_client_set_header(s_openai_cli, "Content-Type", "application/json");
-+        if (esp_http_client_open(s_openai_cli, blen) == ESP_OK &&
-+            esp_http_client_write(s_openai_cli, json, blen) == (int)blen &&
-+            esp_http_client_fetch_headers(s_openai_cli) >= 0 &&
-+            esp_http_client_get_status_code(s_openai_cli) == 200) {
-+            ok = true;
-+            char chunk[1536], line[1536], pend[1024];
-+            size_t llen = 0, plen = 0;
-+            bool done = false;
-+            for (;;) {
-+                int n = esp_http_client_read(s_openai_cli, chunk, sizeof(chunk));
-+                if (n <= 0) {
-+                    ok = done || reply[0] != '\0';
-+                    break;
-+                }
-+                for (int i = 0; i < n && !done; i++) {
-+                    char c = chunk[i];
-+                    if (c != '\n') {
-+                        if (llen < sizeof(line) - 1) {
-+                            line[llen++] = c;
-+                        }
-+                        continue;
-+                    }
-+                    line[llen] = '\0';
-+                    llen = 0;
-+                    if (strncmp(line, "data: ", 6)) {
-+                        continue;
-+                    }
-+                    const char *s = line + 6;
-+                    if (!strcmp(s, "[DONE]")) {
-+                        done = true;
-+                        break;
-+                    }
-+                    cJSON *e = cJSON_Parse(s);
-+                    if (!e) {
-+                        continue;
-+                    }
-+                    cJSON *ch = cJSON_GetArrayItem(cJSON_GetObjectItem(e, "choices"), 0);
-+                    const char *delta = ch ? cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(ch, "delta"), "content")) : nullptr;
-+                    if (delta && delta[0]) {
-+                        strlcat(reply, delta, replysz);
-+                        const char *d = delta;
-+                        size_t dl = strlen(d);
-+                        while (dl > 0) {
-+                            if (plen + dl >= sizeof(pend) - 1) {
-+                                if (plen > 0) {   /* flush first so nothing is dropped */
-+                                    brain_pump_audio();
-+                                    tts_fetch_sentence(pend, plen);
-+                                    plen = 0;
-+                                    pend[0] = '\0';
-+                                }
-+                                if (dl >= sizeof(pend) - 1) {   /* cut the delta at a UTF-8 boundary */
-+                                    size_t take = sizeof(pend) - 1;
-+                                    while (take > 0 && (((const unsigned char *)d)[take] & 0xC0) == 0x80) {
-+                                        take--;
-+                                    }
-+                                    memcpy(pend, d, take);
-+                                    plen = take;
-+                                    pend[plen] = '\0';
-+                                    brain_pump_audio();
-+                                    tts_fetch_sentence(pend, plen);
-+                                    plen = 0;
-+                                    pend[0] = '\0';
-+                                    d += take;
-+                                    dl -= take;
-+                                    continue;
-+                                }
-+                            }
-+                            memcpy(pend + plen, d, dl);
-+                            plen += dl;
-+                            pend[plen] = '\0';
-+                            break;
-+                        }
-+                        bool brk = plen >= sizeof(pend) - 8;   /* never let it wrap */
-+                        if (!brk && plen >= 2) {
-+                            unsigned char last = (unsigned char)pend[plen - 1];
-+                            brk = last == '.' || last == '!' || last == '?' || last == '\n';
-+                            if (!brk && plen >= 3) {
-+                                const unsigned char *t = (const unsigned char *)pend + plen - 3;
-+                                brk = (t[0] == 0xE3 && t[1] == 0x80 && t[2] == 0x82) ||   /* 。 */
-+                                      (t[0] == 0xEF && t[1] == 0xBC && t[2] == 0x81) ||   /* ！ */
-+                                      (t[0] == 0xEF && t[1] == 0xBC && t[2] == 0x9F) ||   /* ？ */
-+                                      (t[0] == 0xE2 && t[1] == 0x80 && t[2] == 0xA6);     /* … */
-+                            }
-+                        }
-+                        if (brk && plen >= 1) {
-+                            brain_pump_audio();
-+                            tts_fetch_sentence(pend, plen);
-+                            plen = 0;
-+                            pend[0] = '\0';
-+                        }
-+                    }
-+                    cJSON_Delete(e);
-+                }
-+                if (done) {
-+                    break;
-+                }
-+            }
-+            if (plen > 0) {
-+                brain_pump_audio();
-+                tts_fetch_sentence(pend, plen);
-+            }
-+        } else {
-+            ESP_LOGE(TAG, "brain: stream open failed (status %d)", esp_http_client_get_status_code(s_openai_cli));
-+        }
-+        if (ok) {
-+            /* drain the SSE tail so the socket is clean; esp_http_client_open()
-+             * reuses a connected client (IDF: connect() skips when state >=
-+             * CONNECTED), saving a TCP+TLS handshake every turn */
-+            char junk[64];
-+            while (esp_http_client_read(s_openai_cli, junk, sizeof(junk)) > 0) {}
-+        }
-+    }
++    brain_stream_t ctx = {};
++    ctx.reply = reply;
++    ctx.replysz = replysz;
++    ctx.share_speech = brain_share_speech();
++    s_brain_stream = &ctx;
++    /* perform() returns the HTTP client to CONNECTED after consuming the
++     * body. The manual open/read API starts a new connection on every call. */
++    bool ok = http_post(&s_openai_cli, nullptr, BRAIN_CHAT_URL "/chat/completions",
++                        BRAIN_CHAT_KEY, "application/json", json, strlen(json));
++    s_brain_stream = nullptr;
 +    cJSON_free(json);
-+    if (!ok || s_turn.text) {
-+        /* Typed turns give up the socket: the incremental API leaves the
-+         * client mid-response, which a perform()-based caller (STT) would
-+         * misread on its next use. */
-+        esp_http_client_cleanup(s_openai_cli);
-+        s_openai_cli = nullptr;
++    ok = ok && reply[0];
++    if (ok && ctx.plen > 0) {
++        brain_pump_audio();
++        bool reusable = ctx.share_speech && s_openai_cli &&
++                        esp_http_client_is_complete_data_received(s_openai_cli);
++        ok = tts_fetch_sentence(ctx.pend, ctx.plen,
++                                reusable ? &s_openai_cli : &s_tts_cli);
 +    }
 +    return ok;
 +}
@@ -823,7 +1134,7 @@ index a6ad810..101d6dc 100644
  /* ---- Turn: speech ---- */
  
  static void start_tts(void)
-@@ -1526,6 +2198,34 @@ static void start_tts(void)
+@@ -1526,6 +2373,34 @@ static void start_tts(void)
           * end. decode() plays it at the speaker's volume, captions following,
           * and finishes the message once it's drained.
           */
@@ -858,7 +1169,7 @@ index a6ad810..101d6dc 100644
          m.pcm_start = s_turn.pcm_out;
          m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
          m.tts = TTS_ACTIVE;
-@@ -1540,6 +2240,7 @@ static void start_tts(void)
+@@ -1540,6 +2415,7 @@ static void start_tts(void)
  static void tts_data(const uint8_t *data, size_t len)
  {
      if (s_turn.mp3_len + len > MP3_BUF) {
@@ -866,7 +1177,28 @@ index a6ad810..101d6dc 100644
          ESP_LOGW(TAG, "MP3 buffer full, dropping %u bytes", (unsigned)len);
          len = MP3_BUF - s_turn.mp3_len;
      }
-@@ -1880,7 +2581,7 @@ static void drop_connection(const char *why)
+@@ -1618,7 +2494,8 @@ static void decode(void)
+             }
+         }
+         if (s_turn.down_rate != info.hz) {
+-            ESP_LOGI(TAG, "reply audio: %d Hz, %d ch, %d kbps", info.hz, info.channels, info.bitrate_kbps);
++            ESP_LOGI(TAG, "reply audio: %d Hz, %d ch, %d kbps (+%d ms)", info.hz, info.channels,
++                     info.bitrate_kbps, (int)((now_us() - s_turn.start_us) / 1000));
+             s_turn.down_rate = info.hz;
+             resampler_init(&s_turn.down, info.hz, MIC_RATE);
+         }
+@@ -1681,7 +2558,9 @@ static void check_turn(void)
+             return;
+         }
+     }
+-    if (t - s_turn.last_event_us < SETTLE_US) {
++    /* The local brain consumed its complete HTTP reply and all speech above.
++     * Only the Muse agent needs quiet time for possible follow-up messages. */
++    if (!BRAIN_CHAT_URL[0] && t - s_turn.last_event_us < SETTLE_US) {
+         return;
+     }
+     if (s_turn.agent_busy && t - s_turn.last_content_us < (text ? TEXT_BUSY_HOLD_US : BUSY_HOLD_US)) {
+@@ -1880,7 +2759,7 @@ static void drop_connection(const char *why)
      bool in_turn = s_turn.phase != P_IDLE;
      disconnect(why);
      s_auto_next_us = now_us() + s_auto_backoff_us;
@@ -875,11 +1207,31 @@ index a6ad810..101d6dc 100644
          turn_fail("LOST CONNECTION TO MUSE");
      }
      muse_hatch_report(MUSE_HATCH_UNTESTED, "");
-@@ -1954,11 +2655,14 @@ static void hatch_task(void *arg)
+@@ -1941,6 +2820,7 @@ static void handle(const cmd_t &cmd)
+ static void hatch_task(void *arg)
+ {
+     (void)arg;
++    bool brain_prepared = false;
+     for (;;) {
+         cmd_t cmd;
+         /* Resting, the socket's keepalive (PING_US) needs no quicker polls.
+@@ -1954,11 +2834,26 @@ static void hatch_task(void *arg)
                  handle(cmd);
              }
          }
 -        if (!s_connected) {
++        bool wifi_up = muse_wifi_connected();
++        if (!wifi_up) {
++            brain_prepared = false;
++        } else if (BRAIN_CHAT_URL[0] && !brain_prepared && !s_resting &&
++                   s_turn.phase == P_IDLE && now_us() >= 5000000) {
++            /* Let board/audio initialization finish before preparing the
++             * first connection. No model inference runs during this HEAD. */
++            turn_speed(true);
++            brain_http_warmup();
++            turn_speed(false);
++            brain_prepared = true;
++        }
 +        /* A brain turn runs on its own HTTPS calls; the hatch socket is
 +         * irrelevant to it, so keep the turn moving while disconnected. */
 +        bool brain_turn = BRAIN_CHAT_URL[0] && s_turn.phase != P_IDLE;
@@ -892,7 +1244,7 @@ index a6ad810..101d6dc 100644
                  if (ensure_connected()) {
                      s_auto_next_us = INT64_MAX;   /* until it drops */
                      s_auto_backoff_us = AUTO_RETRY_MIN_US;
-@@ -1972,16 +2676,16 @@ static void hatch_task(void *arg)
+@@ -1972,16 +2867,16 @@ static void hatch_task(void *arg)
          }
  
          /* Resting, Wi-Fi may nap; don't wait for the server to go quiet. */
@@ -912,7 +1264,7 @@ index a6ad810..101d6dc 100644
              sent = VOICE_NOTE ? record_note() : pump_mic();
          }
          if (!sent) {
-@@ -1990,24 +2694,33 @@ static void hatch_task(void *arg)
+@@ -1990,24 +2885,33 @@ static void hatch_task(void *arg)
          }
          if (s_turn.phase == P_WAIT_REPLY) {
              start_tts();
@@ -958,7 +1310,7 @@ index a6ad810..101d6dc 100644
              }
          }
      }
-@@ -2037,6 +2750,9 @@ extern "C" void muse_hatch_start(void)
+@@ -2037,6 +2941,9 @@ extern "C" void muse_hatch_start(void)
      }
      cJSON_Hooks hooks = { json_alloc, heap_caps_free };
      cJSON_InitHooks(&hooks);
@@ -968,7 +1320,7 @@ index a6ad810..101d6dc 100644
      /* Keep the command/event queues out of internal DRAM, which Wi-Fi, BLE and
       * mbedTLS can exhaust: when the allocation failed here hatch_task never
       * started and every turn was silently dropped. Fall back to internal RAM
-@@ -2054,6 +2770,14 @@ extern "C" void muse_hatch_start(void)
+@@ -2054,6 +2961,14 @@ extern "C" void muse_hatch_start(void)
      s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
      s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
      s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;
@@ -983,7 +1335,7 @@ index a6ad810..101d6dc 100644
      s_turn.texts = static_cast<char *>(psram_alloc(MAX_MSGS * TEXT_MAX));   /* captions just stay untimed without it */
      s_pcm = static_cast<int16_t *>(psram_alloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)));
      s_pcm16 = static_cast<int16_t *>(psram_alloc((MINIMP3_MAX_SAMPLES_PER_FRAME + 8) * sizeof(int16_t)));
-@@ -2064,6 +2788,7 @@ extern "C" void muse_hatch_start(void)
+@@ -2064,6 +2979,7 @@ extern "C" void muse_hatch_start(void)
      s_turn.tts_msg = -1;
      /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here. */
      if (!s_cmds || !s_events || !s_in || !s_out || !s_turn.chunk || !s_turn.mp3 || (VOICE_NOTE && !s_turn.note) || !s_pcm || !s_pcm16 ||
@@ -1017,8 +1369,27 @@ index c96e3ca..72928f5 100644
          } else if (c == 'a' || c == 's') {
              muse_state_poke();
              muse_menu_key(c == 'a' ? MUSE_MENU_DOWN : MUSE_MENU_SELECT);
+diff --git a/esp32/components/muse/muse_link.c b/esp32/components/muse/muse_link.c
+index b42f8fa..fd4834f 100644
+--- a/esp32/components/muse/muse_link.c
++++ b/esp32/components/muse/muse_link.c
+@@ -183,12 +183,8 @@ void muse_wifi_power(muse_wifi_power_t level)
+         before = WIFI_PS_NONE;   /* as wifi_mgr starts it */
+     }
+     now = level;
+-    /* Resting, the radio wakes for every tenth beacon (the listen interval
+-     * wifi_mgr joins with, about 1 s), not every DTIM; replies can wait that
+-     * long. */
+-    esp_wifi_set_ps(level == MUSE_WIFI_REST   ? WIFI_PS_MAX_MODEM
+-                    : level == MUSE_WIFI_DOZE ? WIFI_PS_MIN_MODEM
+-                                              : before);
++    /* Wake on each DTIM while resting; a turn restores the active setting. */
++    esp_wifi_set_ps(level == MUSE_WIFI_REST ? WIFI_PS_MIN_MODEM : before);
+ }
+ 
+ void muse_wifi_nap(bool nap)
 diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
-index 35a7ff4..ebe99cd 100644
+index 35a7ff4..5ff1e69 100644
 --- a/esp32/components/muse/muse_voice.c
 +++ b/esp32/components/muse/muse_voice.c
 @@ -24,12 +24,22 @@
@@ -1076,7 +1447,7 @@ index 35a7ff4..ebe99cd 100644
  #define RETRY_MAX_US (120LL * 1000000)
  #define STALL_US (30LL * 1000000)               /* Hatch took none of a note this long: give up */
  #define ACK_WAIT_US (30LL * 1000000)            /* asleep, waiting for the VM to have a note */
-@@ -73,6 +97,20 @@ static volatile float s_monitor_db = -100.0f;
+@@ -73,6 +97,22 @@ static volatile float s_monitor_db = -100.0f;
  static volatile bool s_chirp;
  static volatile bool s_loopback;
  static volatile bool s_mp3test;
@@ -1090,6 +1461,8 @@ index 35a7ff4..ebe99cd 100644
 +static int s_wake_sil;              /* consecutive silent 20 ms chunks */
 +static bool s_wake_spoke;
 +static volatile bool s_wake_test;   /* serial 'k': speak the wake phrase out loud */
++static int16_t *s_wake_test_capture; /* actual mic capture, held only for the self-test */
++static size_t s_wake_test_frames;
 +static int64_t s_wake_mute_until_us;   /* after a turn, the reply tail must not re-wake */
 +extern const uint8_t s_wake_test_pcm_start[] asm("_binary_wake_test_pcm_start");
 +extern const uint8_t s_wake_test_pcm_end[] asm("_binary_wake_test_pcm_end");
@@ -1097,7 +1470,46 @@ index 35a7ff4..ebe99cd 100644
  
  /*
   * Pre-roll: while idle the mic keeps running into this ring, so a recording
-@@ -320,7 +358,23 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -262,7 +302,24 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+     rec_stats_t st = { 0 };
+ 
+     size_t n = 0;
+-    if (barge_in) {
++    bool self_test = false;
++#if WAKE_WORD
++    /* k captured the microphone while it played the phrase. Preserve those
++     * samples instead of clearing them and uploading subsequent room noise. */
++    if (s_wake_test_capture && s_wake_turn) {
++        self_test = true;
++        for (size_t i = 0; i < s_wake_test_frames; i += MUSE_AUDIO_CHUNK) {
++            take(&st, s_wake_test_capture + i);
++            n += MUSE_AUDIO_CHUNK;
++        }
++    }
++    free(s_wake_test_capture);
++    s_wake_test_capture = NULL;
++    s_wake_test_frames = 0;
++#endif
++    if (self_test) {
++        /* The embedded phrase is complete; only capture the ordinary tail. */
++    } else if (barge_in) {
+         /* Pressed during playback: the queued tail of the reply is still sounding. */
+         for (int i = 0; i < SETTLE_CHUNKS; i++) {
+             muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK);
+@@ -274,9 +331,9 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+             n += MUSE_AUDIO_CHUNK;
+         }
+     }
+-    size_t pre = n;
+-    bool released = false;
+-    size_t stop_at = MAX_FRAMES;
++    size_t pre = self_test ? 0 : n;
++    bool released = self_test;
++    size_t stop_at = self_test && n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
+     while (n + MUSE_AUDIO_CHUNK <= stop_at) {
+         if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
+             break;
+@@ -320,7 +377,23 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
              released = true;
              stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
          }
@@ -1121,7 +1533,7 @@ index 35a7ff4..ebe99cd 100644
      muse_state_set_level(0);
      *held = n - pre;
  
-@@ -401,10 +455,15 @@ static bool hatch_reply(bool *delivered)
+@@ -401,10 +474,15 @@ static bool hatch_reply(bool *delivered)
          if (n) {
              if (!speaking) {
                  speaking = true;
@@ -1138,7 +1550,7 @@ index 35a7ff4..ebe99cd 100644
              muse_audio_write(buf, n);
              played += n;
          } else if (done) {
-@@ -420,8 +479,8 @@ static bool hatch_reply(bool *delivered)
+@@ -420,8 +498,8 @@ static bool hatch_reply(bool *delivered)
          }
      }
      muse_state_set_level(0);
@@ -1149,7 +1561,7 @@ index 35a7ff4..ebe99cd 100644
      if (!played) {
          /* No speech (TTS unavailable): leave the reply text up for a moment. */
          vTaskDelay(pdMS_TO_TICKS(2500));
-@@ -786,11 +845,172 @@ static bool can_record(void)
+@@ -786,11 +864,184 @@ static bool can_record(void)
      return true;
  }
  
@@ -1302,8 +1714,20 @@ index 35a7ff4..ebe99cd 100644
 +            moved = xTaskGetTickCount();
 +            continue;
 +        }
-+        if (xTaskGetTickCount() - moved > pdMS_TO_TICKS(300000)) {
-+            ESP_LOGE(TAG, "coroner: muse_voice stalled 300 s — all-task backtrace follows");
++        TickType_t stalled = xTaskGetTickCount() - moved;
++        if (stalled > pdMS_TO_TICKS(360000)) {
++            /* A stall this long has never recovered (I2S RX / LCD DMA
++             * completion silently lost); a reboot turns a brick back into
++             * a gadget. The dump above is already in the serial log. */
++            ESP_LOGE(TAG, "coroner: muse_voice stalled %d s — rebooting to recover",
++                     (int)(stalled / configTICK_RATE_HZ));
++            muse_voice_dump_tasks();
++            vTaskDelay(pdMS_TO_TICKS(3000));   /* let the dump drain */
++            esp_restart();
++        }
++        if (stalled > pdMS_TO_TICKS(300000)) {
++            ESP_LOGE(TAG, "coroner: muse_voice stalled %d s — all-task backtrace follows",
++                     (int)(stalled / configTICK_RATE_HZ));
 +            muse_voice_dump_tasks();
 +            moved = xTaskGetTickCount();   /* re-dump each 5 min while stalled */
 +        }
@@ -1322,7 +1746,7 @@ index 35a7ff4..ebe99cd 100644
          bool wake = false;
          if (!pending_down) {
              muse_input_event_t ev;
-@@ -828,6 +1048,24 @@ static void voice_task(void *arg)
+@@ -828,6 +1079,38 @@ static void voice_task(void *arg)
                  muse_audio_chirp(1);
                  pre_reset();
              }
@@ -1332,14 +1756,28 @@ index 35a7ff4..ebe99cd 100644
 +                ESP_LOGI(TAG, "wake test: playing phrase");
 +                const int16_t *pcm = (const int16_t *)s_wake_test_pcm_start;
 +                size_t n = (s_wake_test_pcm_end - s_wake_test_pcm_start) / 2;
++                size_t frames = (n + MUSE_AUDIO_CHUNK - 1) / MUSE_AUDIO_CHUNK * MUSE_AUDIO_CHUNK;
++                free(s_wake_test_capture);
++                s_wake_test_capture = frames < MAX_FRAMES ?
++                    heap_caps_malloc(frames * sizeof(int16_t), MUSE_BIG_CAPS) : NULL;
++                s_wake_test_frames = 0;
 +                /* Play and record in lockstep (full duplex, like the loopback
 +                 * test): blocking the whole phrase first would miss it - the
 +                 * mic must hear the wake word while it is being spoken. */
 +                for (size_t i = 0; i < n; i += MUSE_AUDIO_CHUNK) {
 +                    muse_audio_write(pcm + i, n - i < MUSE_AUDIO_CHUNK ? n - i : MUSE_AUDIO_CHUNK);
 +                    if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) == ESP_OK) {
++                        if (s_wake_test_capture) {
++                            memcpy(s_wake_test_capture + s_wake_test_frames, s_chunk, sizeof(s_chunk));
++                            s_wake_test_frames += MUSE_AUDIO_CHUNK;
++                        }
 +                        wake_feed(s_chunk, MUSE_AUDIO_CHUNK);
 +                    }
++                }
++                if (!s_wake_turn) {
++                    free(s_wake_test_capture);
++                    s_wake_test_capture = NULL;
++                    s_wake_test_frames = 0;
 +                }
 +                pre_reset();
 +            }
@@ -1347,7 +1785,7 @@ index 35a7ff4..ebe99cd 100644
              if (s_mp3test) {
                  s_mp3test = false;
                  int16_t *pcm = NULL;
-@@ -845,6 +1083,11 @@ static void voice_task(void *arg)
+@@ -845,6 +1128,11 @@ static void voice_task(void *arg)
              }
              /* The 20 ms read paces this loop. */
              idle_capture();
@@ -1359,7 +1797,7 @@ index 35a7ff4..ebe99cd 100644
              if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
                  continue;
              }
-@@ -866,6 +1109,12 @@ static void voice_task(void *arg)
+@@ -866,6 +1154,12 @@ static void voice_task(void *arg)
          char why[96];
          bool ok = record(pending_down, &held, why, sizeof(why));
          pending_down = false;
@@ -1372,7 +1810,7 @@ index 35a7ff4..ebe99cd 100644
          if (held < MIN_HELD_FRAMES && !wake) {
              muse_hatch_turn_cancel();
              drop_rec();
-@@ -887,6 +1136,26 @@ static void voice_task(void *arg)
+@@ -887,6 +1181,26 @@ static void voice_task(void *arg)
      }
  }
  
@@ -1399,7 +1837,7 @@ index 35a7ff4..ebe99cd 100644
  esp_err_t muse_voice_start(QueueHandle_t queue)
  {
      s_queue = queue;
-@@ -897,10 +1166,37 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
+@@ -897,10 +1211,37 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
          return ESP_FAIL;
      }
      /* Stack in PSRAM if there is any (this task never writes flash) to spare internal RAM for Wi-Fi/BLE. */
@@ -1438,7 +1876,7 @@ index 35a7ff4..ebe99cd 100644
      return ESP_OK;
  }
  
-@@ -933,6 +1229,14 @@ void muse_voice_request_mp3test(void)
+@@ -933,6 +1274,14 @@ void muse_voice_request_mp3test(void)
      muse_state_nudge();
  }
  
@@ -1474,13 +1912,1171 @@ index 7a3ae28..af8b12f 100644
 +void muse_voice_dump_tasks(void);
 diff --git a/esp32/components/muse/wake_test.pcm b/esp32/components/muse/wake_test.pcm
 new file mode 100644
-index 0000000..8c25a78
-Binary files /dev/null and b/esp32/components/muse/wake_test.pcm differ
+index 0000000000000000000000000000000000000000..8c25a78ff1547fa410ac829d4bb15f8e3610fec0
+GIT binary patch
+literal 85440
+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%0DWPxtyZ`A_3hxV4tLz%^R`NfC
+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
+B8pr?u
+
+literal 0
+HcmV?d00001
+
 diff --git a/esp32/devices/sdkconfig.muse b/esp32/devices/sdkconfig.muse
-index 0d85ac4..6713180 100644
+index 0d85ac4..03220ba 100644
 --- a/esp32/devices/sdkconfig.muse
 +++ b/esp32/devices/sdkconfig.muse
-@@ -91,3 +91,11 @@ CONFIG_MBEDTLS_HARDWARE_AES=n
+@@ -91,3 +91,21 @@ CONFIG_MBEDTLS_HARDWARE_AES=n
  # each new lease back a second before binding it. The router has already
  # checked the address it offers.
  CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP=y
@@ -1492,6 +3088,16 @@ index 0d85ac4..6713180 100644
 +CONFIG_ESP_TASK_WDT_EN=y
 +CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 +CONFIG_FREERTOS_USE_TRACE_FACILITY=y
++
++# TLS 1.3: one round trip fewer than 1.2 on every handshake
++CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y
++CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=y
++
++# Precomputed generator tables accelerate certificate signature verification.
++CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM=y
++
++# Keep TLS 1.3 tickets after reading the server response.
++CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT=y
 diff --git a/esp32/partitions_muse.csv b/esp32/partitions_muse.csv
 index ed4e0c8..e57661c 100644
 --- a/esp32/partitions_muse.csv
@@ -1501,3 +3107,544 @@ index ed4e0c8..e57661c 100644
  prod_data, data, 0x40,    0x820000, 0x1000,
  prod_bak,  data, 0x41,    0x821000, 0x1000,
 +model,     data, spiffs,  0x822000, 0x400000,
+diff --git a/esp32/tests/test_muse_brain_audio.py b/esp32/tests/test_muse_brain_audio.py
+new file mode 100644
+index 0000000..d99fbde
+--- /dev/null
++++ b/esp32/tests/test_muse_brain_audio.py
+@@ -0,0 +1,94 @@
++"""Validate bounded ADPCM WAV files with an independent decoder when available."""
++import io, math, os, shutil, shlex, struct, subprocess, tempfile, unittest, wave
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++MUSE=ROOT/'components/muse'
++
++class BrainAudio(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp=tempfile.TemporaryDirectory();cls.addClassCleanup(cls.tmp.cleanup)
++        out=Path(cls.tmp.name)
++        driver=r'''
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "muse_brain_audio.h"
++int main(int argc,char **argv) {
++ assert(argc==2); size_t cap=strtoul(argv[1],NULL,10);
++ unsigned char *in=malloc(1000000),*guard=malloc(cap+64);
++ assert(in && guard); size_t len=fread(in,1,1000000,stdin);
++ memset(guard,0xa5,cap+64);
++ size_t n=muse_brain_wav_adpcm(guard+32,cap,in,len);
++ for(int i=0;i<32;i++) assert(guard[i]==0xa5 && guard[cap+32+i]==0xa5);
++ if(!n) for(size_t i=0;i<cap;i++) assert(guard[32+i]==0xa5);
++ assert(n<=cap); fwrite(guard+32,1,n,stdout); free(guard);free(in);
++}
++'''
++        (out/'driver.c').write_text(driver);cls.binary=out/'audio'
++        cmd=[*shlex.split(os.environ.get('CC','cc')),'-std=c11','-Wall','-Wextra','-Werror','-I',str(MUSE),str(out/'driver.c'),str(MUSE/'muse_brain_audio.c'),str(MUSE/'muse_adpcm.c'),'-o',str(cls.binary)]
++        r=subprocess.run(cmd,capture_output=True,text=True)
++        if r.returncode:raise AssertionError(r.stdout+r.stderr)
++        cls.ffmpeg=shutil.which('ffmpeg')
++        if cls.ffmpeg:
++            dec=subprocess.run([cls.ffmpeg,'-hide_banner','-decoders'],capture_output=True,text=True)
++            if 'adpcm_ima_wav' not in dec.stdout:cls.ffmpeg=None
++
++    @staticmethod
++    def pcm(samples,rate=16000,channels=1):
++        b=io.BytesIO()
++        with wave.open(b,'wb') as w:
++            w.setnchannels(channels);w.setsampwidth(2);w.setframerate(rate)
++            w.writeframes(struct.pack('<%dh'%len(samples),*samples))
++        return b.getvalue()
++
++    def encode(self,data,cap=400000):
++        r=subprocess.run([str(self.binary),str(cap)],input=data,capture_output=True)
++        self.assertEqual(r.returncode,0,r.stderr.decode(errors='replace'))
++        return r.stdout
++
++    def test_silence_blocks_have_standard_headers_and_exact_fact_length(self):
++        data=self.encode(self.pcm([0]*506))
++        self.assertEqual(len(data),60+512)
++        self.assertEqual(data[:4],b'RIFF');self.assertEqual(data[8:16],b'WAVEfmt ')
++        self.assertEqual(struct.unpack_from('<I',data,4)[0],len(data)-8)
++        self.assertEqual(struct.unpack_from('<HHIIHHHH',data,20),(17,1,16000,8110,256,4,2,505))
++        self.assertEqual(data[40:44],b'fact');self.assertEqual(struct.unpack_from('<I',data,48)[0],506)
++        self.assertEqual(data[52:56],b'data');self.assertEqual(struct.unpack_from('<I',data,56)[0],512)
++        self.assertEqual(data[60:],bytes(512))
++
++    def test_sample_counts_across_block_boundaries_and_capacity_guards(self):
++        for n in [1,2,504,505,506,1009,1010,1011,48000,320000]:
++            with self.subTest(samples=n):
++                data=self.encode(self.pcm([1234]*n));need=60+256*((n+504)//505)
++                self.assertEqual(len(data),need)
++                self.assertEqual(struct.unpack_from('<I',data,48)[0],n)
++                self.assertEqual(data[60:64],b'\xd2\x04\x00\x00')
++                self.assertEqual(self.encode(self.pcm([1234]*n),need-1),b'')
++                self.assertEqual(self.encode(self.pcm([1234]*n),need),data)
++
++    def test_wrong_pcm_formats_and_empty_or_truncated_input_are_rejected(self):
++        valid=self.pcm([10]*1000)
++        for bad in [b'',valid[:43],valid[:44],valid[:-1],self.pcm([10]*1000,8000),self.pcm([10]*1000,channels=2),b'NOPE'+valid[4:]]:
++            self.assertEqual(self.encode(bad),b'')
++        self.assertEqual(self.encode(valid,0),b'')
++        self.assertEqual(self.encode(valid,59),b'')
++
++    def test_streaming_pcm_headers_with_unknown_lengths_are_accepted(self):
++        raw=bytearray(self.pcm([0]*16000));raw[4:8]=raw[40:44]=b'\xff'*4
++        data=self.encode(raw)
++        self.assertEqual(struct.unpack_from('<I',data,48)[0],16000)
++        self.assertLess(len(data),len(raw)//3)
++
++    def test_ffmpeg_decodes_waveform_with_bounded_loss_and_tail_padding(self):
++        if not self.ffmpeg:self.skipTest('FFmpeg IMA ADPCM decoder unavailable')
++        samples=[int(10000*math.sin(2*math.pi*440*i/16000)) for i in range(16000)]
++        data=self.encode(self.pcm(samples));out=Path(self.tmp.name)
++        (out/'encoded.wav').write_bytes(data)
++        r=subprocess.run([self.ffmpeg,'-v','error','-i',str(out/'encoded.wav'),'-f','s16le','-acodec','pcm_s16le','-'],capture_output=True)
++        self.assertEqual(r.returncode,0,r.stderr.decode(errors='replace'))
++        decoded=struct.unpack('<%dh'%(len(r.stdout)//2),r.stdout)
++        self.assertGreaterEqual(len(decoded),len(samples));self.assertLess(len(decoded)-len(samples),505)
++        error=sum(abs(a-b) for a,b in zip(samples,decoded))/len(samples)
++        self.assertLess(error,500)
+diff --git a/esp32/tests/test_muse_brain_http.py b/esp32/tests/test_muse_brain_http.py
+new file mode 100644
+index 0000000..9c659c3
+--- /dev/null
++++ b/esp32/tests/test_muse_brain_http.py
+@@ -0,0 +1,169 @@
++"""Exercise idle-close retries, ticket lifetime and origin changes with fake I/O."""
++import os, shlex, subprocess, tempfile, unittest
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++
++class BrainHTTP(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp=tempfile.TemporaryDirectory(); cls.addClassCleanup(cls.tmp.cleanup)
++        out=Path(cls.tmp.name)
++        src=(ROOT/'components/muse/muse_chat_session.cpp').read_text()
++        origin=src[src.index('static bool same_https_origin('):src.index('static bool brain_share_speech(')]
++        transport=src[src.index('struct brain_transport_t {'):src.index('struct brain_stream_t {')]
++        post=src[src.index('static bool http_post('):src.index('static bool openai_perform(')]
++        code=r'''
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++#ifndef CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++#define CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT 1
++#endif
++#define CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS 1
++#define ESP_OK 0
++#define ESP_FAIL -1
++#define ESP_ERR_INVALID_STATE -2
++#define HTTP_METHOD_POST 1
++#define HTTP_METHOD_HEAD 2
++#define BRAIN_CA "brain root"
++#define TTS_CA "speech root"
++#define ESP_LOGE(tag, ...) ((void)std::printf(__VA_ARGS__))
++using esp_err_t=int;
++struct Raw { bool saved=false, offered=false; };
++using esp_transport_handle_t=Raw *;
++struct Client { Raw *raw; int status=200; void *tag=nullptr; };
++using esp_http_client_handle_t=Client *;
++struct esp_http_client_config_t {
++ const char *url=nullptr,*cert_pem=nullptr; int method=0,timeout_ms=0,buffer_size=0,buffer_size_tx=0;
++ int (*event_handler)(void *)=nullptr; void *user_data=nullptr;
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++ Raw *transport=nullptr;
++#endif
++ bool disable_auto_redirect=false;
++};
++static Client *s_openai_cli,*s_tts_cli;
++static char sink[1024];
++static char *s_http_sink=sink;
++static size_t s_http_sink_len;
++static unsigned s_tts_bytes_total;
++static bool s_tts_first;
++static size_t s_tts_skip;
++struct Stream { char reply[32]={}; size_t llen=0,plen=0; bool done=false; };
++static Stream *s_brain_stream;
++static int made,destroyed,closed,performed;
++struct Response { int err,status; bool body,ticket; };
++static std::vector<Response> responses;
++static size_t response_next;
++static bool latest_ticket;
++static int openai_http_event(void *) { return 0; }
++static const char *esp_err_to_name(int) { return "fake"; }
++Raw *esp_transport_ssl_init() { ++made; return new Raw; }
++void esp_transport_destroy(Raw *r) { ++destroyed; delete r; }
++void esp_transport_set_default_port(Raw *,int p) { assert(p==443); }
++void esp_transport_ssl_set_cert_data(Raw *,const char *,size_t) {}
++Client *esp_http_client_init(const esp_http_client_config_t *cfg) {
++ assert(cfg->disable_auto_redirect && cfg->method==HTTP_METHOD_POST);
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++ return new Client{cfg->transport};
++#else
++ return new Client{nullptr};
++#endif
++}
++void esp_http_client_cleanup(Client *c) { delete c; }
++void esp_http_client_set_url(Client *,const char *) {}
++void esp_http_client_set_method(Client *,int) {}
++void esp_http_client_set_user_data(Client *c,void *tag) { c->tag=tag; }
++void esp_http_client_set_header(Client *,const char *,const char *) {}
++void esp_http_client_set_post_field(Client *,const char *,size_t) {}
++int esp_http_client_close(Client *) { ++closed; return ESP_OK; }
++int esp_http_client_get_status_code(Client *c) { return c->status; }
++enum { ESP_TRANSPORT_SESSION_TICKET_SAVE,ESP_TRANSPORT_SESSION_TICKET_USE };
++int esp_transport_ssl_session_ticket_operation(Raw *r,int op) {
++ if(op==ESP_TRANSPORT_SESSION_TICKET_SAVE) { r->saved=latest_ticket; return ESP_OK; }
++ if(!r->saved) return ESP_ERR_INVALID_STATE; // Public API leaves an old offered pointer intact.
++ r->offered=true; return ESP_OK;
++}
++''' + origin + transport + r'''
++int esp_http_client_perform(Client *c) {
++ ++performed; assert(response_next<responses.size());
++ Response r=responses[response_next++]; c->status=r.status; latest_ticket=r.ticket;
++ if(r.body) {
++  http_save_ticket(c);
++  if(c->tag) s_tts_bytes_total+=100;
++  else if(s_brain_stream) std::strcpy(s_brain_stream->reply,"reply");
++  else { std::strcpy(s_http_sink,"heard"); s_http_sink_len=5; }
++ }
++ return r.err;
++}
++''' + post + r'''
++static bool request(const char *url="https://one.example/v1/stt",void *tag=nullptr) {
++ return http_post(&s_openai_cli,tag,url,"fake key","application/json","{}",2);
++}
++static void good(bool ticket=true) { responses.push_back({ESP_OK,200,true,ticket}); }
++int main(int argc,char **argv) {
++ assert(argc==2); std::string mode=argv[1];
++ if(mode=="warmup") {
++  responses.push_back({ESP_OK,405,false,true}); good();
++  assert(http_post(&s_openai_cli,nullptr,"https://one.example/v1/stt","fake key","application/json","",0,true));
++  assert(s_openai_cli && performed==1 && closed==0); assert(request());
++ } else if(mode=="idle-close") {
++  responses.push_back({ESP_OK,200,false,false}); good();
++  assert(request()); assert(performed==2 && closed==1);
++ } else if(mode=="http-error") {
++  responses.push_back({ESP_OK,401,false,false});
++  assert(!request()); assert(performed==1 && !s_openai_cli);
++ } else if(mode=="started-audio") {
++  responses.push_back({ESP_FAIL,200,true,true});
++  assert(!request("https://one.example/v1/tts",(void *)1)); assert(performed==1);
++ } else if(mode=="started-chat") {
++  Stream stream; s_brain_stream=&stream;
++  responses.push_back({ESP_FAIL,200,true,true});
++  assert(!request()); assert(performed==1 && !std::strcmp(stream.reply,"reply"));
++ } else if(mode=="origin") {
++  good(); good(); assert(request()); assert(request("https://two.example/v1/stt"));
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++  assert(made==2 && destroyed==1); assert(s_brain_transport.ticket_valid);
++#endif
++ } else if(mode=="missing-ticket") {
++  good(); good(false); good(); assert(request()); assert(request());
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++  assert(s_brain_transport.ticket_stale); assert(destroyed==0);
++#endif
++  assert(request());
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++  assert(destroyed==1 && made==2 && !s_brain_transport.ticket_stale);
++#endif
++ } else {
++  good(); good(); assert(request()); assert(request("https://one.example/v1/chat"));
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++  assert(made==1 && destroyed==0 && s_brain_transport.ticket_valid);
++#endif
++ }
++ http_discard(&s_openai_cli); assert(made==destroyed);
++ return 0;
++}
++'''
++        (out/'http.cpp').write_text(code); cls.binaries=[]
++        for custom in (0,1):
++            binary=out/f'http-{custom}'
++            cmd=[*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-Wall','-Wextra','-Werror',f'-DCONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT={custom}',str(out/'http.cpp'),'-o',str(binary)]
++            r=subprocess.run(cmd,capture_output=True,text=True)
++            if r.returncode: raise AssertionError(r.stdout+r.stderr)
++            cls.binaries.append(binary)
++
++    def test_head_warmup_retains_method_not_allowed_connection(self): self.run_case('warmup')
++    def test_idle_close_retries_once(self): self.run_case('idle-close')
++    def test_http_errors_are_not_replayed(self): self.run_case('http-error')
++    def test_audio_already_started_is_not_replayed(self): self.run_case('started-audio')
++    def test_chat_already_started_is_not_replayed(self): self.run_case('started-chat')
++    def test_origin_change_discards_ticket(self): self.run_case('origin')
++    def test_missing_new_ticket_cannot_leave_freed_pointer(self): self.run_case('missing-ticket')
++    def test_same_origin_retains_session(self): self.run_case('same-origin')
++    def run_case(self,case):
++        for binary in self.binaries:
++            with self.subTest(custom=binary.name):
++                r=subprocess.run([str(binary),case],capture_output=True,text=True)
++                self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+diff --git a/esp32/tests/test_muse_brain_stream.py b/esp32/tests/test_muse_brain_stream.py
+new file mode 100644
+index 0000000..f2df863
+--- /dev/null
++++ b/esp32/tests/test_muse_brain_stream.py
+@@ -0,0 +1,129 @@
++"""Check short-reply socket reuse and streaming fallback at HTTP boundaries."""
++import os, shlex, subprocess, tempfile, unittest
++from pathlib import Path
++ROOT = Path(__file__).resolve().parents[1]
++
++class BrainStream(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp = tempfile.TemporaryDirectory()
++        cls.addClassCleanup(cls.tmp.cleanup)
++        out = Path(cls.tmp.name)
++        src = (ROOT/'components/muse/muse_chat_session.cpp').read_text()
++        helpers = src[src.index('static bool same_https_origin('):src.index('/* Own the SSL transports')]
++        context = src[src.index('struct brain_stream_t {'):src.index('static bool s_tts_overflow;')]
++        feed = src[src.index('static void brain_chat_data(const char *data, size_t len)\n{'):src.index('/* Streams the reply: each finished sentence')]
++        stream = src[src.index('static bool brain_chat_stream('):src.index('static void brain_hist_add(')]
++        code = r'''
++#include <cassert>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++#include "host_compat.h"
++#include "cJSON.h"
++#define ESP_LOGI(tag, ...) ((void)std::printf(__VA_ARGS__))
++#define ESP_LOGE(tag, ...) ((void)std::printf(__VA_ARGS__))
++#define BRAIN_CHAT_URL "https://brain.example/v1"
++#define BRAIN_MODEL "test"
++#define BRAIN_SYSTEM "test"
++#define BRAIN_CHAT_KEY "test"
++#define BRAIN_HIST_LEN 512
++#define ESP_OK 0
++#define HTTP_METHOD_POST 1
++static const char *speech_url = "https://brain.example/v1/audio/speech";
++static const char *speech_ca = "trusted root";
++#define TTS_URL speech_url
++#define BRAIN_CA "trusted root"
++#define TTS_CA speech_ca
++struct Client {};
++using esp_http_client_handle_t = Client *;
++
++static esp_http_client_handle_t s_openai_cli, s_tts_cli;
++static bool s_tts_overflow;
++static unsigned s_tts_bytes_total;
++static int s_brain_hist_n;
++static char *s_brain_hist;
++static void brain_pump_audio() {}
++static std::vector<std::string> chunks;
++static bool response_complete, speech_fail;
++static std::vector<bool> shared;
++static std::vector<std::string> spoken;
++static bool esp_http_client_is_complete_data_received(Client *) { return response_complete; }
++static void esp_http_client_cleanup(Client *c) { delete c; }
++static bool tts_fetch_sentence(const char *s, size_t n, esp_http_client_handle_t *cli = &s_tts_cli) {
++ bool reuse = cli == &s_openai_cli;
++ if (reuse) assert(response_complete);
++ shared.push_back(reuse); spoken.emplace_back(s, n);
++ if (reuse && speech_fail) { delete s_openai_cli; s_openai_cli = nullptr; return false; }
++ return true;
++}
++''' + helpers + context + r'''
++static bool http_post(esp_http_client_handle_t *, void *tag, const char *, const char *,
++                      const char *, const char *, size_t) {
++ assert(!tag && s_brain_stream);
++ response_complete=false;
++ for (const auto &chunk : chunks) brain_chat_data(chunk.data(),chunk.size());
++ response_complete=true;
++ return true;
++}
++''' + feed + stream + r'''
++static std::string delta(const char *s) {
++ cJSON *r=cJSON_CreateObject(), *a=cJSON_CreateArray(), *c=cJSON_CreateObject(), *d=cJSON_CreateObject();
++ cJSON_AddItemToObject(r,"choices",a); cJSON_AddItemToArray(a,c);
++ cJSON_AddItemToObject(c,"delta",d); cJSON_AddStringToObject(d,"content",s);
++ char *raw=cJSON_PrintUnformatted(r); std::string out="data: "; out+=raw; out+="\n\n";
++ cJSON_free(raw); cJSON_Delete(r); return out;
++}
++int main(int argc, char **argv) {
++ assert(argc == 2); std::string mode=argv[1];
++ assert(same_https_origin("https://a:443/x", "https://a:443/y"));
++ assert(!same_https_origin("https://a/x", "https://a.evil/x"));
++ assert(!same_https_origin("https://a:443/x", "https://a:444/y"));
++ assert(!same_https_origin("http://a/x", "https://a/x"));
++ assert(!same_https_origin("https:///x", "https:///y"));
++ if (mode=="other-host") speech_url="https://speech.example/v1/audio/speech";
++ if (mode=="other-ca") speech_ca="another root";
++ if (mode=="failure") speech_fail=true;
++ s_openai_cli=new Client;
++ chunks={delta("First."), "data: [DONE]\n\n", "\n"};
++ std::string long_first(130,'A'); long_first+='.';
++ if (mode=="multi") chunks={delta(long_first.c_str()),delta("Second!"),"data: [DONE]\n\n","\n"};
++ if (mode=="two-short") chunks={delta("Hi."),delta("Hello!"),"data: [DONE]\n\n","\n"};
++ if (mode=="no-punctuation") chunks={delta("Four"),"data: [DONE]\n\n","\n"};
++ if (mode=="truncated") chunks={delta("Partial")};
++ if (mode=="split") {
++  std::string wire=delta("天空蓝。"); chunks.clear();
++  for (char c : wire) chunks.emplace_back(1,c);
++  chunks.push_back("data: [DONE]\n\n");
++ }
++ char reply[2048]; bool ok=brain_chat_stream("hello",reply,sizeof(reply));
++ if(mode=="failure") { assert(!ok); assert(!s_openai_cli); }
++ else { assert(ok); assert(s_openai_cli); esp_http_client_cleanup(s_openai_cli); }
++ if(mode=="multi") { assert(spoken.size()==2); assert(!shared[0] && !shared[1]); assert(spoken[0]==long_first && spoken[1]=="Second!"); }
++ else { assert(spoken.size()==1); assert(shared[0] == (mode!="other-host" && mode!="other-ca")); }
++ return 0;
++}
++'''
++        (out/'stream.cpp').write_text(code)
++        cjson=ROOT/'managed_components/espressif__cjson/cJSON'
++        includes=['-I',str(cjson),'-I',str(ROOT/'tests')]
++        commands=[[*shlex.split(os.environ.get('CC','cc')),'-std=c11',*includes,'-c',str(cjson/'cJSON.c'),'-o',str(out/'cjson.o')],
++                  [*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-Wall','-Wextra','-Werror',*includes,str(out/'stream.cpp'),str(out/'cjson.o'),'-o',str(out/'stream')]]
++        for cmd in commands:
++            result=subprocess.run(cmd,capture_output=True,text=True)
++            if result.returncode: raise AssertionError(result.stdout+result.stderr)
++        cls.binary=out/'stream'
++
++    def test_short_reply_reuses_only_after_response_is_drained(self): self.run_case('single')
++    def test_two_short_sentences_share_one_speech_request(self): self.run_case('two-short')
++    def test_multiple_sentences_keep_streaming(self): self.run_case('multi')
++    def test_different_origin_keeps_separate_client(self): self.run_case('other-host')
++    def test_different_trust_keeps_separate_client(self): self.run_case('other-ca')
++    def test_unpunctuated_reply_can_share(self): self.run_case('no-punctuation')
++    def test_completed_http_without_sse_done_preserves_reply(self): self.run_case('truncated')
++    def test_sse_and_utf8_can_span_response_chunks(self): self.run_case('split')
++    def test_failed_shared_request_discards_client(self): self.run_case('failure')
++    def run_case(self,name):
++        r=subprocess.run([str(self.binary),name],capture_output=True,text=True)
++        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+diff --git a/esp32/tests/test_muse_chat_session.py b/esp32/tests/test_muse_chat_session.py
+index 7847475..83b2bef 100644
+--- a/esp32/tests/test_muse_chat_session.py
++++ b/esp32/tests/test_muse_chat_session.py
+@@ -22,9 +22,14 @@ class ChatSession(unittest.TestCase):
+         out = Path(cls.tmp.name)
+         source = (ROOT / 'components/muse/muse_chat_session.cpp').read_text()
+         constants = source[source.index('#define MIC_RATE'):source.index('/* ---- Voice task')]
++        # These harnesses exercise the Muse transport without provider credentials.
++        constants = (constants[:constants.index('#include "provider_config.h"')] +
++                     '#define BRAIN_CHAT_URL test_brain_url\n' +
++                     constants[constants.index('#define TEXT_HOLD_S'):])
+         types = source[source.index('enum phase_t'):source.index('/* 10 KB')]
+         handlers = source[source.index('static int find_msg('):source.index('static void on_chat_ack(')]
+         reset = source[source.index('static bool turn_start('):source.index('static void turn_begin(')]
++        check_turn = source[source.index('static void check_turn(void)'):source.index('/* ---- Inbound dispatch') ]
+         code = r'''
+ #include <cassert>
+ #include <cstdint>
+@@ -37,14 +42,18 @@ class ChatSession(unittest.TestCase):
+ #include "minimp3.h"
+ #include "muse_chat_priv.h"
+ #define ESP_LOGI(...) ((void)0)
++#define ESP_LOGW(...) ((void)0)
+ ''' + constants + types + r'''
+ static turn_t s_turn;
++static const char *test_brain_url = "";
++static int64_t test_clock = 12345;
++static void turn_speed(bool) {}
+ static char s_reply_shown[EV_TEXT];
+ static int64_t s_last_seq, s_marks[4];
+ static int captions, console_events;
+ enum mark_t { M_TEXT, M_DONE };
+ static void mark(mark_t) {}
+-static int64_t now_us() { return 12345; }
++static int64_t now_us() { return test_clock; }
+ static void emit(muse_hatch_ev_t type, const char *) {
+     if (type == MUSE_HATCH_EV_REPLY) captions++;
+ }
+@@ -54,11 +63,14 @@ bool muse_hatch_caption_at(const char *text, size_t, char *out, size_t cap) {
+     strlcpy(out, text, cap); return text[0];
+ }
+ static void turn_finish() { s_turn.phase = P_IDLE; }
++static void turn_done(bool) { turn_finish(); }
++static void log_marks() {}
++static void on_dictation_end(bool) { turn_finish(); }
+ static void turn_fail(const char *) { turn_finish(); }
+ static bool ensure_connected() { return true; }
+ bool muse_hatch_configured() { return true; }
+ static void resampler_init(resampler_t *, int, int) {}
+-''' + reset + handlers + r'''
++''' + reset + handlers + check_turn + r'''
+ static void begin(bool typed = false) {
+     assert(turn_start(s_turn.gen + 1, typed));
+     s_turn.phase = P_WAIT_REPLY;
+@@ -128,12 +140,40 @@ static void bounded_rejections() {
+     event("message.assistant", "second", "note", "Second");
+     assert(s_turn.nmsgs == 2 && s_turn.msgs[0].done && s_turn.msgs[1].done);
+ }
++static void completed_brain_skips_agent_settle() {
++    test_brain_url = "https://brain.example/v1";
++    begin();
++    s_turn.nmsgs = 1;
++    s_turn.msgs[0].done = true;
++    s_turn.msgs[0].tts = TTS_ACTIVE;
++    s_turn.last_event_us = test_clock;
++    check_turn();
++    assert(s_turn.phase == P_WAIT_REPLY);  /* speech is still pending */
++    s_turn.msgs[0].tts = TTS_FINISHED;
++    check_turn();
++    assert(s_turn.phase == P_IDLE);
++}
++static void muse_agent_still_waits_for_followups() {
++    test_brain_url = "";
++    begin();
++    s_turn.nmsgs = 1;
++    s_turn.msgs[0].done = true;
++    s_turn.msgs[0].tts = TTS_FINISHED;
++    s_turn.last_event_us = test_clock;
++    check_turn();
++    assert(s_turn.phase == P_WAIT_REPLY);
++    test_clock += SETTLE_US;
++    check_turn();
++    assert(s_turn.phase == P_IDLE);
++}
+ int main(int argc, char **argv) {
+     assert(argc == 2);
+     switch (atoi(argv[1])) {
+     case 0: rejected_deltas(); break;
+     case 1: valid_parents(); break;
+     case 2: bounded_rejections(); break;
++    case 3: completed_brain_skips_agent_settle(); break;
++    case 4: muse_agent_still_waits_for_followups(); break;
+     default: return 2;
+     }
+ }
+@@ -166,3 +206,9 @@ int main(int argc, char **argv) {
+ 
+     def test_rejection_capacity_preserves_correlation(self):
+         self.run_case(2)
++
++    def test_completed_brain_skips_settle_but_waits_for_speech(self):
++        self.run_case(3)
++
++    def test_muse_agent_keeps_its_followup_window(self):
++        self.run_case(4)
+diff --git a/esp32/tests/test_muse_voice_note.py b/esp32/tests/test_muse_voice_note.py
+index 8403bec..babb820 100644
+--- a/esp32/tests/test_muse_voice_note.py
++++ b/esp32/tests/test_muse_voice_note.py
+@@ -209,6 +209,9 @@ class VoiceNoteHelpers(unittest.TestCase):
+ HATCH_DRIVER = r'''
+ static StreamBufferHandle_t s_in;
+ static turn_t s_turn;
++static uint8_t *s_brain_note;
++static size_t s_brain_note_len;
++static void brain_voice_reply() { CHECK(false); }
+ 
+ /* The mic backlog: `avail` bytes of `mic` have arrived; each receive is also
+  * held to the next entry of `sched`, when there is one, to vary its size. */
+@@ -314,6 +317,10 @@ class HatchVoiceNote(NoteRequestAssertions, unittest.TestCase):
+             return source[at:source.index('\n', at) + 1]
+ 
+         constants = source[source.index('#define MIC_RATE'):source.index('/* ---- Voice task')]
++        # These harnesses exercise the Muse transport without provider credentials.
++        constants = (constants[:constants.index('#include "provider_config.h"')] +
++                     '#define BRAIN_CHAT_URL ""\n' +
++                     constants[constants.index('#define TEXT_HOLD_S'):])
+         types = source[source.index('enum phase_t'):source.index('/* 10 KB')]
+         note = source[source.index('static bool send_note_part('):source.index('static void send_chat(')]
+         code = r'''

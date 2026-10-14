@@ -131,7 +131,7 @@ Three independent OpenAI-compatible endpoints, configured in `provider_config.h`
 | Transcription | `BRAIN_STT_URL` / `BRAIN_STT_MODEL` | Multipart WAV POST; shares the chat key. |
 | Chat | `BRAIN_CHAT_URL` / `BRAIN_MODEL` (+ `BRAIN_CHAT_EXTRA`) | SSE streaming; empty URL falls back to the stock Muse cloud agent. |
 
-Each endpoint pins its own root CA (`OPENAI_CA` = GTS Root R4 for api.openai.com, `ISRG_CA` = ISRG Root X1 for Let's Encrypt hosts). `provider_config.h` also carries `DEV_WIFI_SSID`/`DEV_WIFI_PASS` for headless provisioning: on boot, if the board has no saved Wi-Fi, it writes the credentials and a placeholder hatch token — no Muse app, no BLE pairing, no account.
+Each endpoint pins its own root CA (`OPENAI_CA` = GTS Root R4 for api.openai.com, `ISRG_CA` = Root YE + ISRG Root X1 for Let's Encrypt hosts). `provider_config.h` also carries `DEV_WIFI_SSID`/`DEV_WIFI_PASS` for headless provisioning: on boot, if the board has no saved Wi-Fi, it writes the credentials and a placeholder hatch token — no Muse app, no BLE pairing, no account.
 
 ## Turn pipeline
 
@@ -148,9 +148,11 @@ PTT release → record finalized (min 0.3 s, else "DIDN'T CATCH THAT")
   → turn ends when all messages are done and settled 3 s (or the cap: 180 s voice / 15 min typed)
 ```
 
-Two sessions, not one: the speech connection must stay open while the chat stream is still being read, so they cannot share. Both persist across turns; a failed request `cleanup()`s only its own client.
+Short replies can use one session: after the chat HTTP response is fully consumed, speech reuses its client when HTTPS authority and pinned roots match. Replies up to 128 UTF-8 bytes are batched for one speech request; longer replies use a separate speech client while chat continues streaming. `perform()` and its data callback retain the client state correctly; the manual `open()` path in IDF 6 started a new connection each turn. A stale socket gets one immediate retry before any reply data arrives. TLS 1.3 tickets are saved after reading response headers and scoped to the provider origin; changing hosts discards the old ticket. A HEAD request prepares the connection after Wi-Fi becomes ready (and before recording if no client exists); a 405 response is expected for a POST-only transcription endpoint and still establishes authenticated TLS.
 
-## Latency receipts
+## Earlier latency receipts (v0.2.0)
+
+The v0.2.4 measurements and conditions are recorded in the [changelog](../CHANGELOG.md).
 
 Measured on a Watcher over 2.4 GHz Wi-Fi, QuickSilver preset (deepseek-v4.1-flash with reasoning excluded, whisper-large-v3-turbo, chatterbox-turbo):
 
