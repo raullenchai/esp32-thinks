@@ -347,7 +347,7 @@ index 0000000..d3d02a9
 +}
 +#endif
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index a6ad810..88cddde 100644
+index a6ad810..27279d6 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
 @@ -42,6 +42,7 @@
@@ -378,7 +378,7 @@ index a6ad810..88cddde 100644
  
  #include <xplat/noise/core/ClientSession.h>
  #include <xplat/noise/core/PsaCryptoBackend.h>
-@@ -101,6 +107,29 @@ static const char *TAG = "muse_chat_session";
+@@ -101,6 +107,31 @@ static const char *TAG = "muse_chat_session";
  #define TEXT_MAX 1024                      /* a message's text, for captions timed to its speech */
  #define SPEECH_CHARS_PER_S 14              /* until the speech's length is known */
  #define TEXT_CHARS_PER_S 16                /* speaker off: reading pace, a little over speech */
@@ -404,11 +404,13 @@ index a6ad810..88cddde 100644
 +
 +static bool brain_http_warmup(bool probe = false);
 +static void brain_voice_reply(void);
++static void brain_cancel_http(void);
++static void drain_out(void);
 +static void brain_text_turn(const char *text);
  #define TEXT_HOLD_S 2                      /* speaker off: how long a message's last lines stay up */
  
  #define PING_US (20 * 1000000LL)
-@@ -168,6 +197,7 @@ static char s_host[MUSE_HOST_MAX + 1];
+@@ -168,6 +199,7 @@ static char s_host[MUSE_HOST_MAX + 1];
  /* When to connect without a turn asking: once Wi-Fi is up, again with backoff
   * if that fails or the connection drops, not after an idle close. */
  static int64_t s_auto_next_us;
@@ -416,7 +418,7 @@ index a6ad810..88cddde 100644
  static int64_t s_auto_backoff_us = AUTO_RETRY_MIN_US;
  
  /* ---- Streams on the connection ---- */
-@@ -254,6 +284,27 @@ EXT_RAM_BSS_ATTR static turn_t s_turn;
+@@ -254,6 +286,27 @@ EXT_RAM_BSS_ATTR static turn_t s_turn;
  enum mark_t : uint8_t { M_RELEASE, M_SENT, M_ACK, M_TEXT, M_DONE, M_TTS, M_MP3, M_AUDIO, M_COUNT };
  static const char *const MARK_NAMES[M_COUNT] = { "release", "sent", "ack", "text", "done", "tts", "mp3", "audio" };
  static int64_t s_marks[M_COUNT];
@@ -444,7 +446,7 @@ index a6ad810..88cddde 100644
  static char s_reply_shown[EV_TEXT];   /* the pre-speech caption last sent */
  
  static void mark(mark_t m);
-@@ -953,6 +1004,7 @@ static void turn_reset_streams(void)
+@@ -953,6 +1006,7 @@ static void turn_reset_streams(void)
  
  static void turn_finish(void)
  {
@@ -452,7 +454,17 @@ index a6ad810..88cddde 100644
      turn_reset_streams();
      s_turn.phase = P_IDLE;
      s_turn.dict_id = s_turn.chat_id = 0;
-@@ -1003,10 +1055,11 @@ static bool turn_start(uint32_t gen, bool text)
+@@ -985,6 +1039,9 @@ static void turn_done(bool complete)
+ /* Ends any turn in progress and starts a fresh one. False if Hatch can't be reached. */
+ static bool turn_start(uint32_t gen, bool text)
+ {
++    if (s_turn.phase != P_IDLE && s_turn.gen != gen) {
++        brain_cancel_http();
++    }
+     if (s_turn.phase != P_IDLE) {
+         if (s_turn.text) {
+             turn_fail("INTERRUPTED");
+@@ -1003,10 +1060,11 @@ static bool turn_start(uint32_t gen, bool text)
      s_turn.text = text;
      s_turn.tts_msg = -1;
      memset(s_marks, 0, sizeof(s_marks));
@@ -465,7 +477,7 @@ index a6ad810..88cddde 100644
          turn_fail(muse_hatch_configured() ? "CAN'T REACH MUSE" : "MUSE NOT SET UP");
          return false;
      }
-@@ -1019,6 +1072,14 @@ static void turn_begin(uint32_t gen)
+@@ -1019,6 +1077,14 @@ static void turn_begin(uint32_t gen)
          return;
      }
      if (VOICE_NOTE) {
@@ -480,7 +492,7 @@ index a6ad810..88cddde 100644
          if (!open_note()) {
              disconnect("chat open failed");
              turn_fail("CAN'T REACH MUSE");
-@@ -1131,6 +1192,24 @@ static bool open_note(void)
+@@ -1131,6 +1197,24 @@ static bool open_note(void)
  /* Moves the mic into the note request; on release, sends the rest and waits for the reply. */
  static bool record_note(void)
  {
@@ -505,7 +517,7 @@ index a6ad810..88cddde 100644
      for (;;) {
          size_t room = NOTE_PART_BYTES - s_turn.note_len;
          size_t left = NOTE_MAX_BYTES - s_turn.pcm_bytes;
-@@ -1171,6 +1250,10 @@ static bool record_note(void)
+@@ -1171,6 +1255,10 @@ static bool record_note(void)
   */
  static void send_chat(const char *text, const char *modality)
  {
@@ -516,7 +528,7 @@ index a6ad810..88cddde 100644
      s_turn.chat_posted = true;
      cJSON *body = cJSON_CreateObject();
      cJSON_AddStringToObject(body, "message", text);
-@@ -1220,14 +1303,18 @@ static void post_chat(const char *text)
+@@ -1220,14 +1308,18 @@ static void post_chat(const char *text)
  /* A typed turn: the text goes straight to the chat. */
  static void text_begin(const char *text)
  {
@@ -537,7 +549,7 @@ index a6ad810..88cddde 100644
      }
  }
  
-@@ -1382,6 +1469,17 @@ static void message_done(int i, const char *final_text)
+@@ -1382,6 +1474,17 @@ static void message_done(int i, const char *final_text)
          if (final_text && final_text[0] && strlen(final_text) != m.len) {
              n = strlen(final_text);
              muse_hatch_console("final", final_text, "\"msg\":%d", i);
@@ -555,7 +567,7 @@ index a6ad810..88cddde 100644
          }
          muse_hatch_console("message_done", nullptr, "\"msg\":%d,\"bytes\":%u", i, (unsigned)n);
          ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)n);
-@@ -1499,6 +1597,818 @@ static void on_chat_ack(stream_t *s)
+@@ -1499,6 +1602,938 @@ static void on_chat_ack(stream_t *s)
      emit(MUSE_HATCH_EV_SENT, nullptr);
  }
  
@@ -608,7 +620,7 @@ index a6ad810..88cddde 100644
 +/* Own the SSL transports so post-handshake TLS 1.3 tickets can be saved
 + * after reading headers. IDF's automatic save occurs before tickets arrive. */
 +struct brain_transport_t {
-+    esp_transport_handle_t handle;
++    esp_transport_handle_t handle, polling;
 +    char origin[256];
 +    bool ticket_valid, ticket_stale;
 +};
@@ -619,6 +631,52 @@ index a6ad810..88cddde 100644
 +    return cli == &s_openai_cli ? s_brain_transport : s_speech_transport;
 +}
 +
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++/* IDF's async HTTP state machine still calls transport select(timeout_ms).
++ * Bound each wait and report idle reads/writes as EAGAIN, not truncated data. */
++static esp_transport_handle_t http_payload(esp_transport_handle_t t)
++{
++    return static_cast<brain_transport_t *>(esp_transport_get_context_data(t))->handle;
++}
++static int http_poll_connect(esp_transport_handle_t t, const char *host, int port, int)
++{
++    /* TCP setup can exceed one audio tick; TLS remains nonblocking. */
++    return esp_transport_connect_async(http_payload(t), host, port, 500);
++}
++static int http_poll_read(esp_transport_handle_t t, char *buf, int len, int)
++{
++    int n = esp_transport_read(http_payload(t), buf, len, 50);
++    if (n == 0 || n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE) {
++        errno = EAGAIN;
++        return -1;
++    }
++    return n;
++}
++static int http_poll_write(esp_transport_handle_t t, const char *buf, int len, int)
++{
++    int n = esp_transport_write(http_payload(t), buf, len, 50);
++    if (n == 0 || n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE) {
++        errno = EAGAIN;
++        return -1;
++    }
++    return n;
++}
++static int http_poll_close(esp_transport_handle_t t)
++{
++    return esp_transport_close(http_payload(t));
++}
++#endif
++
++static int http_socket(esp_http_client_handle_t cli)
++{
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++    return cli ? esp_transport_get_socket(http_transport(
++        cli == s_openai_cli ? &s_openai_cli : &s_tts_cli).handle) : -1;
++#else
++    return esp_http_client_get_socket(cli);
++#endif
++}
++
 +static void http_discard(esp_http_client_handle_t *cli)
 +{
 +    if (*cli) {
@@ -626,6 +684,10 @@ index a6ad810..88cddde 100644
 +        *cli = nullptr;
 +    }
 +    brain_transport_t &transport = http_transport(cli);
++    if (transport.polling) {
++        esp_transport_destroy(transport.polling);
++        transport.polling = nullptr;
++    }
 +    if (transport.handle) {
 +        esp_transport_destroy(transport.handle);
 +        transport.handle = nullptr;
@@ -666,13 +728,57 @@ index a6ad810..88cddde 100644
 +static bool s_tts_first;      /* the next TTS response chunk is the first one */
 +static size_t s_tts_skip;     /* ID3 tag bytes still to skip (the tag can span chunks) */
 +
++/* The HTTP owner polls asynchronous I/O, including TLS connection setup.
++ * Only this task closes or frees clients; producers cancel via generation. */
++static uint32_t s_http_progress[2];
++
++static bool brain_http_cancelled(void)
++{
++    return s_turn.phase != P_IDLE && s_turn.gen != s_gen.load();
++}
++
++static esp_err_t brain_http_perform(esp_http_client_handle_t *cli, bool warmup)
++{
++    int64_t deadline = now_us() + (warmup ? 5000000LL : 30000000LL);
++    for (;;) {
++        if (!warmup && brain_http_cancelled()) return ESP_FAIL;
++        unsigned index = cli == &s_openai_cli ? 0 : 1;
++        uint32_t before = s_http_progress[index];
++        esp_err_t err = esp_http_client_perform(*cli);
++        if (!warmup && s_http_progress[index] != before) deadline = now_us() + 30000000LL;
++        if (err != ESP_ERR_HTTP_EAGAIN) return err;
++        if (now_us() >= deadline) return ESP_ERR_TIMEOUT;
++        vTaskDelay(1);   /* yield one tick; cancellation never waits for network I/O */
++    }
++}
++
++static void brain_cancel_http(void)
++{
++    http_discard(&s_openai_cli);
++    http_discard(&s_tts_cli);
++    s_tts_first = false;
++    s_tts_overflow = false;
++    s_tts_bytes_total = 0;
++    s_tts_skip = 0;
++    s_turn.mp3_len = 0;
++    s_turn.mp3_ended = false;
++    s_turn.kbps = s_turn.down_rate = 0;
++    mp3dec_init(&s_turn.dec);
++    drain_out();
++}
++
 +static esp_err_t openai_http_event(esp_http_client_event_t *evt)
 +{
++    if (evt->client && (evt->event_id == HTTP_EVENT_ON_CONNECTED ||
++        evt->event_id == HTTP_EVENT_HEADERS_SENT || evt->event_id == HTTP_EVENT_ON_HEADERS_COMPLETE ||
++        evt->event_id == HTTP_EVENT_ON_DATA)) {
++        s_http_progress[evt->client == s_openai_cli ? 0 : 1]++;
++    }
 +    if (evt->event_id == HTTP_EVENT_ON_CONNECTED && evt->client) {
 +        /* Headers and the small chat/TTS body are separate writes. Let the
 +         * body leave immediately rather than waiting for a delayed ACK. */
 +        ESP_LOGI(TAG, "brain: HTTPS connected (%s)", evt->client == s_openai_cli ? "chat/STT" : "speech");
-+        int fd = esp_http_client_get_socket(evt->client);
++        int fd = http_socket(evt->client);
 +        int on = 1;
 +        if (fd >= 0) {
 +            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
@@ -680,6 +786,9 @@ index a6ad810..88cddde 100644
 +    }
 +    if (evt->event_id == HTTP_EVENT_ON_HEADERS_COMPLETE && evt->client) {
 +        http_save_ticket(evt->client);
++    }
++    if (evt->event_id == HTTP_EVENT_ON_DATA && brain_http_cancelled()) {
++        return ESP_FAIL;
 +    }
 +    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->client &&
 +        esp_http_client_get_status_code(evt->client) == 200) {
@@ -732,6 +841,7 @@ index a6ad810..88cddde 100644
 +static bool http_post(esp_http_client_handle_t *cli, void *tag, const char *url, const char *key,
 +                      const char *content_type, const char *body, size_t len, bool warmup = false)
 +{
++    if (!warmup && brain_http_cancelled()) return false;
 +    brain_transport_t &transport = http_transport(cli);
 +    size_t origin_len = strcspn(url + (strncmp(url, "https://", 8) ? 0 : 8), "/?#") + 8;
 +    if (strncmp(url, "https://", 8) || origin_len >= sizeof(transport.origin)) {
@@ -746,9 +856,16 @@ index a6ad810..88cddde 100644
 +    if (!*cli) {
 +#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
 +        transport.handle = esp_transport_ssl_init();
-+        if (!transport.handle) {
++        transport.polling = esp_transport_init();
++        if (!transport.handle || !transport.polling) {
++            http_discard(cli);
 +            return false;
 +        }
++        esp_transport_set_context_data(transport.polling, &transport);
++        esp_transport_set_default_port(transport.polling, 443);
++        esp_transport_set_func(transport.polling, nullptr, http_poll_read, http_poll_write,
++                               http_poll_close, nullptr, nullptr, nullptr);
++        esp_transport_set_async_connect_func(transport.polling, http_poll_connect);
 +#endif
 +        memcpy(transport.origin, url, origin_len);
 +        transport.origin[origin_len] = '\0';
@@ -762,6 +879,7 @@ index a6ad810..88cddde 100644
 +        cfg.method = HTTP_METHOD_POST;
 +        cfg.cert_pem = ca;
 +        cfg.timeout_ms = 30000;
++        cfg.is_async = true;
 +        /* Exceed ALWAYSINTERNAL so HTTP buffers live in PSRAM, leaving
 +         * internal memory for the audio drivers and Wi-Fi while WakeNet runs. */
 +#if CONFIG_SPIRAM
@@ -773,7 +891,7 @@ index a6ad810..88cddde 100644
 +        cfg.event_handler = openai_http_event;
 +        cfg.user_data = tag;
 +#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
-+        cfg.transport = transport.handle;
++        cfg.transport = transport.polling;
 +#endif
 +        cfg.disable_auto_redirect = true;
 +        *cli = esp_http_client_init(&cfg);
@@ -794,7 +912,11 @@ index a6ad810..88cddde 100644
 +    esp_http_client_set_header(*cli, "Content-Type", content_type);
 +    esp_http_client_set_post_field(*cli, body, len);
 +    uint32_t audio_before = s_tts_bytes_total;
-+    esp_err_t err = esp_http_client_perform(*cli);
++    esp_err_t err = brain_http_perform(cli, warmup);
++    if (!warmup && brain_http_cancelled()) {
++        http_discard(cli);
++        return false;
++    }
 +    int status = esp_http_client_get_status_code(*cli);
 +    bool empty = tag ? s_tts_bytes_total == audio_before :
 +                 (s_brain_stream ? !s_brain_stream->reply[0] : !s_http_sink_len);
@@ -815,7 +937,11 @@ index a6ad810..88cddde 100644
 +            s_tts_skip = 0;
 +        }
 +        esp_http_client_close(*cli);
-+        err = esp_http_client_perform(*cli);
++        err = brain_http_perform(cli, warmup);
++        if (!warmup && brain_http_cancelled()) {
++            http_discard(cli);
++            return false;
++        }
 +        status = esp_http_client_get_status_code(*cli);
 +        empty = tag ? s_tts_bytes_total == audio_before :
 +                (s_brain_stream ? !s_brain_stream->reply[0] : !s_http_sink_len);
@@ -847,11 +973,11 @@ index a6ad810..88cddde 100644
 +{
 +    const char *url = BRAIN_STT_URL[0] ? BRAIN_STT_URL : BRAIN_CHAT_URL "/chat/completions";
 +    if (!probe && s_openai_cli && !s_brain_transport.ticket_stale &&
-+        same_https_origin(s_brain_transport.origin, url) && esp_http_client_get_socket(s_openai_cli) >= 0) {
++        same_https_origin(s_brain_transport.origin, url) && http_socket(s_openai_cli) >= 0) {
 +        return true;
 +    }
 +    bool ok = http_post(&s_openai_cli, nullptr, url, BRAIN_CHAT_KEY, "application/json", "", 0, true);
-+    if (ok && esp_http_client_get_socket(s_openai_cli) < 0) {
++    if (ok && http_socket(s_openai_cli) < 0) {
 +        /* A complete HEAD with Connection: close did not leave a warm socket. */
 +        http_discard(&s_openai_cli);
 +        return false;
@@ -883,7 +1009,7 @@ index a6ad810..88cddde 100644
 +    if (!BRAIN_CHAT_URL[0] || !turn_idle || queued) {
 +        return;
 +    }
-+    if (idle.prepared && (!s_openai_cli || esp_http_client_get_socket(s_openai_cli) < 0)) {
++    if (idle.prepared && (!s_openai_cli || http_socket(s_openai_cli) < 0)) {
 +        idle.prepared = false;
 +        idle.next_us = now_us();
 +    }
@@ -1074,6 +1200,9 @@ index a6ad810..88cddde 100644
 +    for (int attempt = 0; attempt < 2 && !got; attempt++) {
 +        if (!openai_perform(BRAIN_STT_URL, BRAIN_CHAT_KEY, "multipart/form-data; boundary=" BRAIN_BOUNDARY,
 +                        reinterpret_cast<const char *>(s_brain_post), hlen + len + tlen, 1)) {
++            if (brain_http_cancelled()) {
++                return false;
++            }
 +            ESP_LOGE(TAG, "STT http failed (attempt %d)", attempt);
 +            continue;
 +        }
@@ -1103,7 +1232,7 @@ index a6ad810..88cddde 100644
 +
 +static void brain_pump_audio(void)
 +{
-+    while (s_turn.mp3_len + 8192 > MP3_BUF) {
++    while (!brain_http_cancelled() && s_turn.mp3_len + 8192 > MP3_BUF) {
 +        if (s_turn.text) {
 +            /* Typed turns have no playback drain of their own: without this a
 +             * long reply fills s_out, decode() stalls and the pump spins. */
@@ -1116,6 +1245,9 @@ index a6ad810..88cddde 100644
 +
 +static void brain_chat_data(const char *data, size_t len)
 +{
++    if (brain_http_cancelled()) {
++        return;
++    }
 +    brain_stream_t &ctx = *s_brain_stream;
 +    char *reply = ctx.reply;
 +    size_t replysz = ctx.replysz;
@@ -1124,7 +1256,7 @@ index a6ad810..88cddde 100644
 +    size_t &llen = ctx.llen, &plen = ctx.plen;
 +    bool &done = ctx.done;
 +    bool &share_speech = ctx.share_speech;
-+    for (size_t i = 0; i < len && !done; i++) {
++    for (size_t i = 0; i < len && !done && !brain_http_cancelled(); i++) {
 +        char c = data[i];
 +        if (c != '\n') {
 +            if (llen < sizeof(line) - 1) {
@@ -1374,7 +1506,7 @@ index a6ad810..88cddde 100644
  /* ---- Turn: speech ---- */
  
  static void start_tts(void)
-@@ -1526,6 +2436,34 @@ static void start_tts(void)
+@@ -1526,6 +2561,34 @@ static void start_tts(void)
           * end. decode() plays it at the speaker's volume, captions following,
           * and finishes the message once it's drained.
           */
@@ -1409,7 +1541,7 @@ index a6ad810..88cddde 100644
          m.pcm_start = s_turn.pcm_out;
          m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
          m.tts = TTS_ACTIVE;
-@@ -1540,6 +2478,7 @@ static void start_tts(void)
+@@ -1540,6 +2603,7 @@ static void start_tts(void)
  static void tts_data(const uint8_t *data, size_t len)
  {
      if (s_turn.mp3_len + len > MP3_BUF) {
@@ -1417,7 +1549,7 @@ index a6ad810..88cddde 100644
          ESP_LOGW(TAG, "MP3 buffer full, dropping %u bytes", (unsigned)len);
          len = MP3_BUF - s_turn.mp3_len;
      }
-@@ -1618,7 +2557,8 @@ static void decode(void)
+@@ -1618,7 +2682,8 @@ static void decode(void)
              }
          }
          if (s_turn.down_rate != info.hz) {
@@ -1427,7 +1559,7 @@ index a6ad810..88cddde 100644
              s_turn.down_rate = info.hz;
              resampler_init(&s_turn.down, info.hz, MIC_RATE);
          }
-@@ -1681,7 +2621,9 @@ static void check_turn(void)
+@@ -1681,7 +2746,9 @@ static void check_turn(void)
              return;
          }
      }
@@ -1438,7 +1570,7 @@ index a6ad810..88cddde 100644
          return;
      }
      if (s_turn.agent_busy && t - s_turn.last_content_us < (text ? TEXT_BUSY_HOLD_US : BUSY_HOLD_US)) {
-@@ -1880,7 +2822,7 @@ static void drop_connection(const char *why)
+@@ -1880,7 +2947,7 @@ static void drop_connection(const char *why)
      bool in_turn = s_turn.phase != P_IDLE;
      disconnect(why);
      s_auto_next_us = now_us() + s_auto_backoff_us;
@@ -1447,7 +1579,25 @@ index a6ad810..88cddde 100644
          turn_fail("LOST CONNECTION TO MUSE");
      }
      muse_hatch_report(MUSE_HATCH_UNTESTED, "");
-@@ -1941,12 +2883,16 @@ static void handle(const cmd_t &cmd)
+@@ -1915,7 +2982,8 @@ static void handle(const cmd_t &cmd)
+         }
+         break;
+     case CMD_CANCEL:
+-        if (cmd.gen == s_turn.gen && !s_turn.text && s_turn.phase != P_IDLE) {
++        if (cmd.gen == s_turn.gen && !s_turn.text) {
++            brain_cancel_http();
+             ESP_LOGI(TAG, "turn cancelled");
+             turn_finish();
+         }
+@@ -1930,6 +2998,7 @@ static void handle(const cmd_t &cmd)
+         break;
+     case CMD_TEXT_CANCEL:
+         if (s_turn.text && s_turn.phase != P_IDLE) {
++            brain_cancel_http();
+             turn_fail("CANCELLED");
+         }
+         break;
+@@ -1941,12 +3010,16 @@ static void handle(const cmd_t &cmd)
  static void hatch_task(void *arg)
  {
      (void)arg;
@@ -1464,7 +1614,7 @@ index a6ad810..88cddde 100644
          TickType_t wait = wait_ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
          if (xQueueReceive(s_cmds, &cmd, wait) == pdTRUE) {
              handle(cmd);
-@@ -1954,11 +2900,16 @@ static void hatch_task(void *arg)
+@@ -1954,11 +3027,16 @@ static void hatch_task(void *arg)
                  handle(cmd);
              }
          }
@@ -1483,7 +1633,7 @@ index a6ad810..88cddde 100644
                  if (ensure_connected()) {
                      s_auto_next_us = INT64_MAX;   /* until it drops */
                      s_auto_backoff_us = AUTO_RETRY_MIN_US;
-@@ -1972,16 +2923,16 @@ static void hatch_task(void *arg)
+@@ -1972,16 +3050,16 @@ static void hatch_task(void *arg)
          }
  
          /* Resting, Wi-Fi may nap; don't wait for the server to go quiet. */
@@ -1503,7 +1653,7 @@ index a6ad810..88cddde 100644
              sent = VOICE_NOTE ? record_note() : pump_mic();
          }
          if (!sent) {
-@@ -1990,24 +2941,33 @@ static void hatch_task(void *arg)
+@@ -1990,24 +3068,33 @@ static void hatch_task(void *arg)
          }
          if (s_turn.phase == P_WAIT_REPLY) {
              start_tts();
@@ -1549,7 +1699,7 @@ index a6ad810..88cddde 100644
              }
          }
      }
-@@ -2037,6 +2997,9 @@ extern "C" void muse_hatch_start(void)
+@@ -2037,6 +3124,9 @@ extern "C" void muse_hatch_start(void)
      }
      cJSON_Hooks hooks = { json_alloc, heap_caps_free };
      cJSON_InitHooks(&hooks);
@@ -1559,7 +1709,7 @@ index a6ad810..88cddde 100644
      /* Keep the command/event queues out of internal DRAM, which Wi-Fi, BLE and
       * mbedTLS can exhaust: when the allocation failed here hatch_task never
       * started and every turn was silently dropped. Fall back to internal RAM
-@@ -2054,6 +3017,14 @@ extern "C" void muse_hatch_start(void)
+@@ -2054,6 +3144,14 @@ extern "C" void muse_hatch_start(void)
      s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
      s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
      s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;
@@ -1574,7 +1724,7 @@ index a6ad810..88cddde 100644
      s_turn.texts = static_cast<char *>(psram_alloc(MAX_MSGS * TEXT_MAX));   /* captions just stay untimed without it */
      s_pcm = static_cast<int16_t *>(psram_alloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)));
      s_pcm16 = static_cast<int16_t *>(psram_alloc((MINIMP3_MAX_SAMPLES_PER_FRAME + 8) * sizeof(int16_t)));
-@@ -2064,6 +3035,7 @@ extern "C" void muse_hatch_start(void)
+@@ -2064,6 +3162,7 @@ extern "C" void muse_hatch_start(void)
      s_turn.tts_msg = -1;
      /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here. */
      if (!s_cmds || !s_events || !s_in || !s_out || !s_turn.chunk || !s_turn.mp3 || (VOICE_NOTE && !s_turn.note) || !s_pcm || !s_pcm16 ||
@@ -1582,6 +1732,16 @@ index a6ad810..88cddde 100644
          xTaskCreatePinnedToCoreWithCaps(hatch_task, "muse_chat", 48 * 1024, nullptr, 5, nullptr, 0,
                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
          ESP_LOGE(TAG, "start failed");
+@@ -2141,7 +3240,8 @@ extern "C" void muse_hatch_text_turn(char *text)
+ 
+ extern "C" void muse_hatch_text_cancel(void)
+ {
+-    post(CMD_TEXT_CANCEL, 0);
++    uint32_t gen = s_gen.fetch_add(1);
++    post(CMD_TEXT_CANCEL, gen);
+ }
+ 
+ extern "C" muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap)
 diff --git a/esp32/components/muse/muse_input.c b/esp32/components/muse/muse_input.c
 index c96e3ca..72928f5 100644
 --- a/esp32/components/muse/muse_input.c
@@ -1740,11 +1900,68 @@ index b42f8fa..fd4834f 100644
  }
  
  void muse_wifi_nap(bool nap)
+diff --git a/esp32/components/muse/muse_speech_guard.h b/esp32/components/muse/muse_speech_guard.h
+new file mode 100644
+index 0000000..4fe3c8c
+--- /dev/null
++++ b/esp32/components/muse/muse_speech_guard.h
+@@ -0,0 +1,51 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++#include <stdbool.h>
++
++typedef struct {
++    float floor_db;
++    unsigned voiced_run_ms;
++    unsigned quiet_ms;
++    unsigned elapsed_ms;
++    bool speech;
++} muse_speech_guard_t;
++
++static inline void muse_speech_guard_feed_vad(muse_speech_guard_t *g, float db, unsigned ms, bool voice)
++{
++    g->elapsed_ms += ms;
++    g->quiet_ms += ms;
++    if (voice && db > g->floor_db + 6.0f) {
++        g->voiced_run_ms += ms;
++        if (g->voiced_run_ms >= 80) {
++            g->speech = true;
++            g->quiet_ms = 0;
++        }
++    } else {
++        g->voiced_run_ms = 0;
++    }
++}
++
++static inline void muse_speech_guard_feed(muse_speech_guard_t *g, float db, unsigned ms)
++{
++    muse_speech_guard_feed_vad(g, db, ms, true);
++}
++
++static inline bool muse_speech_guard_stop(const muse_speech_guard_t *g)
++{
++    return g->elapsed_ms >= 2000 && g->quiet_ms >= 3000;
++}
 diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
-index 35a7ff4..5aae285 100644
+index 35a7ff4..c7ff11a 100644
 --- a/esp32/components/muse/muse_voice.c
 +++ b/esp32/components/muse/muse_voice.c
-@@ -24,12 +24,23 @@
+@@ -24,12 +24,27 @@
  #include "esp_heap_caps.h"
  #include "esp_log.h"
  #include "esp_timer.h"
@@ -1761,6 +1978,10 @@ index 35a7ff4..5aae285 100644
  #include "muse_adpcm.h"
  #include "muse_audio.h"
 +#include "muse_io_watch.h"
++#include "muse_speech_guard.h"
++#if CONFIG_IDF_TARGET_ESP32S3
++#include "esp_vad.h"
++#endif
 +#include "muse_link.h"
 +#include "muse_settings.h"
 +#include "muse_wifi.h"
@@ -1768,7 +1989,7 @@ index 35a7ff4..5aae285 100644
  #include "muse_board.h"
  #include "muse_chat.h"
  #include "muse_input.h"
-@@ -37,8 +48,22 @@
+@@ -37,8 +52,24 @@
  #include "muse_settings.h"
  #include "muse_state.h"
  #include "muse_wifi.h"
@@ -1788,10 +2009,12 @@ index 35a7ff4..5aae285 100644
  
  static const char *TAG = "muse_voice";
 +static float s_reply_max_lvl;
++static float s_noise_db = -70.0f;
++static unsigned s_noise_chunks;
  
  #define MAX_SECS 15
  #define TAIL_FRAMES (MUSE_AUDIO_RATE * 12 / 100)   /* capture lag + poll interval, stops before the release click */
-@@ -62,7 +87,7 @@ static const char *TAG = "muse_voice";
+@@ -62,7 +93,7 @@ static const char *TAG = "muse_voice";
  #define HELD_TRIES 8                            /* then a saved note is dropped */
  #define HELD_POLL_MS 5000                       /* resting with notes saved: check for Wi-Fi this often */
  #define HELD_KEEP_US (30LL * 60 * 1000000)      /* muse_voice_notes_waiting() */
@@ -1800,7 +2023,7 @@ index 35a7ff4..5aae285 100644
  #define RETRY_MAX_US (120LL * 1000000)
  #define STALL_US (30LL * 1000000)               /* Hatch took none of a note this long: give up */
  #define ACK_WAIT_US (30LL * 1000000)            /* asleep, waiting for the VM to have a note */
-@@ -73,6 +98,22 @@ static volatile float s_monitor_db = -100.0f;
+@@ -73,6 +104,22 @@ static volatile float s_monitor_db = -100.0f;
  static volatile bool s_chirp;
  static volatile bool s_loopback;
  static volatile bool s_mp3test;
@@ -1823,9 +2046,102 @@ index 35a7ff4..5aae285 100644
  
  /*
   * Pre-roll: while idle the mic keeps running into this ring, so a recording
-@@ -262,7 +303,24 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
-     rec_stats_t st = { 0 };
+@@ -86,6 +133,7 @@ typedef struct {
+ #else
+     int16_t pcm[MUSE_AUDIO_CHUNK];
+ #endif
++    float db;
+ } pre_chunk_t;
  
+ static pre_chunk_t *s_pre;   /* PRE_CHUNKS, a ring */
+@@ -146,6 +194,7 @@ static void idle_capture(void)
+         vTaskDelay(pdMS_TO_TICKS(20));
+         return;
+     }
++    float noise = muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK);
+     if (s_monitor) {
+         float db = muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK);
+         s_monitor_db = db > s_monitor_db ? db : s_monitor_db * 0.9f + db * 0.1f;
+@@ -155,6 +204,7 @@ static void idle_capture(void)
+         return;
+     }
+     pre_chunk_t *c = &s_pre[s_pre_next];
++    c->db = noise;
+ #if MUSE_LOW_MEM
+     c->start = s_pre_enc;
+     muse_adpcm_encode_block(&s_pre_enc, s_chunk, MUSE_AUDIO_CHUNK, c->adpcm);
+@@ -163,6 +213,21 @@ static void idle_capture(void)
+ #endif
+     s_pre_next = (s_pre_next + 1) % PRE_CHUNKS;
+     s_pre_fill = s_pre_fill < PRE_CHUNKS ? s_pre_fill + 1 : PRE_CHUNKS;
++    if (s_pre_fill == PRE_CHUNKS) {
++        float levels[PRE_CHUNKS];
++        for (int i = 0; i < PRE_CHUNKS; i++) {
++            int j = i;
++            while (j > 0 && levels[j - 1] > s_pre[i].db) {
++                levels[j] = levels[j - 1];
++                j--;
++            }
++            levels[j] = s_pre[i].db;
++        }
++        float background = levels[PRE_CHUNKS / 2];
++        if (!s_noise_chunks) { s_noise_db = background; s_noise_chunks = 1; }
++        else if (background < s_noise_db + 6.0f) s_noise_db += 0.1f * (background - s_noise_db);
++        else s_noise_db += 0.002f;   /* avoid learning a wake phrase as background */
++    }
+ }
+ 
+ /* Non-blocking: returns true if an event of `type` arrived (others dropped). */
+@@ -185,6 +250,10 @@ typedef struct {
+     float floor_db;
+     float tail_db[25];   /* the last 0.5 s, to see where speech ends and the release click lands */
+     size_t chunks;
++    muse_speech_guard_t guard;
++#if CONFIG_IDF_TARGET_ESP32S3
++    vad_handle_t vad;
++#endif
+ } rec_stats_t;
+ 
+ /* Adds one captured chunk (up to MUSE_AUDIO_CHUNK frames) to the stats. */
+@@ -199,6 +268,11 @@ static void keep(rec_stats_t *st, const int16_t *pcm, size_t n)
+     st->frames += n;
+     if (n == MUSE_AUDIO_CHUNK) {
+         float db = muse_audio_dbfs(pcm, n);
++        bool voice = true;
++#if CONFIG_IDF_TARGET_ESP32S3
++        if (st->vad) voice = vad_process(st->vad, (int16_t *)pcm, MUSE_AUDIO_RATE, 20) == VAD_SPEECH;
++#endif
++        muse_speech_guard_feed_vad(&st->guard, db, 20, voice);
+         st->floor_db = db < st->floor_db ? db : st->floor_db;
+         st->tail_db[st->chunks++ % 25] = db;
+     }
+@@ -252,6 +326,20 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+     muse_state_set_progress(0);
+     s_rec_n = s_sent = 0;
+     s_live = s_tried = false;
++    rec_stats_t st = { 0 };
++    st.floor_db = st.guard.floor_db = s_noise_db;
++#if CONFIG_IDF_TARGET_ESP32S3
++    /* WebRTC VAD state is ~0.8 KB and is freed before STT/TLS work. Leave
++     * headroom; the vendor constructor assumes its allocations succeed. */
++    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 1536) {
++        st.vad = vad_create(VAD_MODE_2);
++        for (size_t i = 0; st.vad && i < s_pre_fill; i++) {
++            pre_get(i, s_chunk);
++            vad_process(st.vad, s_chunk, MUSE_AUDIO_RATE, 20);
++        }
++    }
++    ESP_LOGI(TAG, "speech guard: noise %.1f dBFS, classifier %s", (double)s_noise_db, st.vad ? "on" : "unavailable");
++#endif
+     if (!s_rec || (muse_hatch_ready() && !s_held_count)) {
+         go_live();
+     }
+@@ -259,10 +347,25 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+     bool heard = false, ok = true;
+     bool gave_up = false;   /* Hatch failed this note: it's kept, and goes later */
+     char text[96];
+-    rec_stats_t st = { 0 };
+-
      size_t n = 0;
 -    if (barge_in) {
 +    bool self_test = false;
@@ -1849,7 +2165,7 @@ index 35a7ff4..5aae285 100644
          /* Pressed during playback: the queued tail of the reply is still sounding. */
          for (int i = 0; i < SETTLE_CHUNKS; i++) {
              muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK);
-@@ -274,9 +332,9 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -274,9 +377,9 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
              n += MUSE_AUDIO_CHUNK;
          }
      }
@@ -1862,7 +2178,20 @@ index 35a7ff4..5aae285 100644
      while (n + MUSE_AUDIO_CHUNK <= stop_at) {
          if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
              break;
-@@ -320,7 +378,23 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -303,6 +406,12 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+             }
+         }
+         n += MUSE_AUDIO_CHUNK;
++        if (muse_speech_guard_stop(&st.guard)) {
++            released = true;
++            ESP_LOGI(TAG, "recording stopped: 3 s quiet, speech=%d, noise %.1f dBFS",
++                     (int)st.guard.speech, (double)st.guard.floor_db);
++            break;
++        }
+         bool tick = n % (MUSE_AUDIO_CHUNK * 5) == 0;
+         if (tick && s_rec && !s_live && !gave_up && !s_held_count && muse_hatch_ready()) {
+             ESP_LOGI(TAG, "Muse in reach: streaming the note so far");
+@@ -320,7 +429,26 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
              released = true;
              stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
          }
@@ -1883,10 +2212,26 @@ index 35a7ff4..5aae285 100644
 +#if WAKE_WORD
 +    s_wake_turn = false;
 +#endif
++#if CONFIG_IDF_TARGET_ESP32S3
++    if (st.vad) vad_destroy(st.vad);
++#endif
      muse_state_set_level(0);
      *held = n - pre;
  
-@@ -401,10 +475,15 @@ static bool hatch_reply(bool *delivered)
+@@ -335,6 +463,12 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+     ESP_LOGI(TAG, "recorded %.2fs%s: rms %.1f dBFS, peak %.1f dBFS, floor %.1f dBFS, %d clipped, gain %d dB",
+              (double)n / MUSE_AUDIO_RATE, released ? "" : " (max)", rms_db < -100.0f ? -100.0f : rms_db,
+              20.0 * log10((st.peak + 1) / 32768.0), st.floor_db, st.clipped, muse_settings_mic_gain());
++    if (!st.guard.speech) {
++        strlcpy(why, "DIDN'T CATCH THAT", cap);
++        ESP_LOGI(TAG, "recording discarded: no speech above adaptive noise floor %.1f dBFS",
++                 (double)st.guard.floor_db);
++        return false;
++    }
+     return ok;
+ }
+ 
+@@ -401,10 +535,15 @@ static bool hatch_reply(bool *delivered)
          if (n) {
              if (!speaking) {
                  speaking = true;
@@ -1903,7 +2248,7 @@ index 35a7ff4..5aae285 100644
              muse_audio_write(buf, n);
              played += n;
          } else if (done) {
-@@ -420,8 +499,8 @@ static bool hatch_reply(bool *delivered)
+@@ -420,8 +559,8 @@ static bool hatch_reply(bool *delivered)
          }
      }
      muse_state_set_level(0);
@@ -1914,7 +2259,7 @@ index 35a7ff4..5aae285 100644
      if (!played) {
          /* No speech (TTS unavailable): leave the reply text up for a moment. */
          vTaskDelay(pdMS_TO_TICKS(2500));
-@@ -786,11 +865,194 @@ static bool can_record(void)
+@@ -786,11 +925,194 @@ static bool can_record(void)
      return true;
  }
  
@@ -2109,7 +2454,7 @@ index 35a7ff4..5aae285 100644
          bool wake = false;
          if (!pending_down) {
              muse_input_event_t ev;
-@@ -828,6 +1090,38 @@ static void voice_task(void *arg)
+@@ -828,6 +1150,38 @@ static void voice_task(void *arg)
                  muse_audio_chirp(1);
                  pre_reset();
              }
@@ -2148,7 +2493,7 @@ index 35a7ff4..5aae285 100644
              if (s_mp3test) {
                  s_mp3test = false;
                  int16_t *pcm = NULL;
-@@ -845,6 +1139,11 @@ static void voice_task(void *arg)
+@@ -845,6 +1199,11 @@ static void voice_task(void *arg)
              }
              /* The 20 ms read paces this loop. */
              idle_capture();
@@ -2160,7 +2505,7 @@ index 35a7ff4..5aae285 100644
              if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
                  continue;
              }
-@@ -866,6 +1165,12 @@ static void voice_task(void *arg)
+@@ -866,6 +1225,14 @@ static void voice_task(void *arg)
          char why[96];
          bool ok = record(pending_down, &held, why, sizeof(why));
          pending_down = false;
@@ -2168,12 +2513,23 @@ index 35a7ff4..5aae285 100644
 +        /* record() plays the reply before it returns, so arm the cooldown
 +         * here: a window set before the turn would expire during a long
 +         * reply and let its tail re-wake the device. */
-+        s_wake_mute_until_us = esp_timer_get_time() + 4000000;
++        if (ok) {
++            s_wake_mute_until_us = esp_timer_get_time() + 4000000;
++        }
 +#endif
          if (held < MIN_HELD_FRAMES && !wake) {
              muse_hatch_turn_cancel();
              drop_rec();
-@@ -887,6 +1192,26 @@ static void voice_task(void *arg)
+@@ -874,6 +1241,8 @@ static void voice_task(void *arg)
+             continue;
+         }
+         if (!ok) {
++            muse_hatch_turn_cancel();
++            drop_rec();
+             pre_reset();
+             go_idle(why);   /* Hatch failed it while recording */
+             continue;
+@@ -887,6 +1256,26 @@ static void voice_task(void *arg)
      }
  }
  
@@ -2200,7 +2556,7 @@ index 35a7ff4..5aae285 100644
  esp_err_t muse_voice_start(QueueHandle_t queue)
  {
      s_queue = queue;
-@@ -897,10 +1222,37 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
+@@ -897,10 +1286,37 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
          return ESP_FAIL;
      }
      /* Stack in PSRAM if there is any (this task never writes flash) to spare internal RAM for Wi-Fi/BLE. */
@@ -2239,7 +2595,7 @@ index 35a7ff4..5aae285 100644
      return ESP_OK;
  }
  
-@@ -933,6 +1285,14 @@ void muse_voice_request_mp3test(void)
+@@ -933,6 +1349,14 @@ void muse_voice_request_mp3test(void)
      muse_state_nudge();
  }
  
@@ -3572,10 +3928,10 @@ index 0000000..d99fbde
 +        self.assertLess(error,500)
 diff --git a/esp32/tests/test_muse_brain_http.py b/esp32/tests/test_muse_brain_http.py
 new file mode 100644
-index 0000000..ffb5c3c
+index 0000000..06574dc
 --- /dev/null
 +++ b/esp32/tests/test_muse_brain_http.py
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,329 @@
 +"""Exercise idle-close retries, ticket lifetime and origin changes with fake I/O."""
 +import os, shlex, subprocess, tempfile, unittest
 +from pathlib import Path
@@ -3590,15 +3946,24 @@ index 0000000..ffb5c3c
 +        origin=src[src.index('static bool same_https_origin('):src.index('static bool brain_share_speech(')]
 +        transport=src[src.index('struct brain_transport_t {'):src.index('struct brain_stream_t {')]
 +        post=src[src.index('static bool http_post('):src.index('static bool openai_perform(')]
++        cancellation=src[src.index('/* The HTTP owner polls asynchronous I/O'):src.index('static void brain_cancel_http(void)\n{')]
 +        maintenance=src[src.index('static bool brain_http_warmup(bool probe)'):src.index('/* Streams one message MP3')]
 +        code=r'''
 +#include <cassert>
++#include <cerrno>
 +#include <cstdint>
 +#include <cstdio>
 +#include <cstring>
 +#include <string>
 +#include <vector>
 +#include <algorithm>
++#include <atomic>
++#include <mutex>
++#include <thread>
++#include <chrono>
++#include <sys/socket.h>
++#include <poll.h>
++#include <unistd.h>
 +#ifndef CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
 +#define CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT 1
 +#endif
@@ -3606,6 +3971,10 @@ index 0000000..ffb5c3c
 +#define ESP_OK 0
 +#define ESP_FAIL -1
 +#define ESP_ERR_INVALID_STATE -2
++#define ESP_ERR_HTTP_EAGAIN -3
++#define ESP_ERR_TIMEOUT -4
++#define ESP_TLS_ERR_SSL_WANT_READ -100
++#define ESP_TLS_ERR_SSL_WANT_WRITE -101
 +#define HTTP_METHOD_POST 1
 +#define HTTP_METHOD_HEAD 2
 +#define BRAIN_CA "brain root"
@@ -3616,9 +3985,9 @@ index 0000000..ffb5c3c
 +#define ESP_LOGI(tag, ...) ((void)std::printf(__VA_ARGS__))
 +#define ESP_LOGE(tag, ...) ((void)std::printf(__VA_ARGS__))
 +using esp_err_t=int;
-+struct Raw { bool saved=false, offered=false; };
++struct Raw { bool saved=false, offered=false, wrapper=false; void *context=nullptr; int fd=1; };
 +using esp_transport_handle_t=Raw *;
-+struct Client { Raw *raw; int status=200; void *tag=nullptr; int timeout=0; bool open=true; };
++struct Client { Raw *raw; int status=200; void *tag=nullptr; int timeout=0; bool open=true; int fd=1; };
 +using esp_http_client_handle_t=Client *;
 +struct esp_http_client_config_t {
 + const char *url=nullptr,*cert_pem=nullptr; int method=0,timeout_ms=0,buffer_size=0,buffer_size_tx=0;
@@ -3626,7 +3995,7 @@ index 0000000..ffb5c3c
 +#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
 + Raw *transport=nullptr;
 +#endif
-+ bool disable_auto_redirect=false;
++ bool disable_auto_redirect=false; bool is_async=false;
 +};
 +static Client *s_openai_cli,*s_tts_cli;
 +static char sink[1024];
@@ -3638,30 +4007,49 @@ index 0000000..ffb5c3c
 +struct Stream { char reply[32]={}; size_t llen=0,plen=0; bool done=false; };
 +static Stream *s_brain_stream;
 +static int made,destroyed,closed,performed;
-+struct Response { int err,status; bool body,ticket; bool close=false; };
++struct Response { int err,status; bool body,ticket; bool close=false; bool cancel=false; int64_t advance_us=0; };
 +static std::vector<Response> responses;
 +static size_t response_next;
++enum { P_IDLE, P_WAIT_REPLY };
++static struct { int phase=P_IDLE; uint32_t gen=0; } s_turn;
++static std::atomic<uint32_t> s_gen{0};
 +static bool latest_ticket;
 +static int64_t clock_us;
 +static int speed_taken,speed_released;
 +static int64_t now_us() { return clock_us; }
++static void vTaskDelay(int) { clock_us+=1000; std::this_thread::sleep_for(std::chrono::microseconds(100)); }
 +static void turn_speed(bool on) { if(on) ++speed_taken; else ++speed_released; }
 +static int openai_http_event(void *) { return 0; }
 +static const char *esp_err_to_name(int) { return "fake"; }
 +Raw *esp_transport_ssl_init() { ++made; return new Raw; }
-+void esp_transport_destroy(Raw *r) { ++destroyed; delete r; }
++Raw *esp_transport_init() { auto r=new Raw; r->wrapper=true; return r; }
++void esp_transport_destroy(Raw *r) { if(!r->wrapper) ++destroyed; delete r; }
++void *esp_transport_get_context_data(Raw *r) { return r->context; }
++void esp_transport_set_context_data(Raw *r,void *p) { r->context=p; }
++void esp_transport_set_func(Raw *,void *,int (*)(Raw *,char *,int,int),int (*)(Raw *,const char *,int,int),int (*)(Raw *),void *,void *,void *) {}
++void esp_transport_set_async_connect_func(Raw *,int (*)(Raw *,const char *,int,int)) {}
++static int io_result,io_wait;
++int esp_transport_read(Raw *r,char *buf,int len,int ms) {
++ io_wait=ms;
++ if(r->fd>=3) { pollfd fd{r->fd,POLLIN,0}; if(poll(&fd,1,ms)==0)return 0; return recv(r->fd,buf,len,MSG_DONTWAIT); }
++ return io_result;
++}
++int esp_transport_write(Raw *,const char *,int,int ms) { io_wait=ms; return io_result; }
++int esp_transport_connect_async(Raw *,const char *,int,int ms) { io_wait=ms; return 0; }
++int esp_transport_close(Raw *) { return ESP_OK; }
++int esp_transport_get_socket(Raw *r) { return r ? r->fd : -1; }
 +void esp_transport_set_default_port(Raw *,int p) { assert(p==443); }
 +void esp_transport_ssl_set_cert_data(Raw *,const char *,size_t) {}
 +Client *esp_http_client_init(const esp_http_client_config_t *cfg) {
-+ assert(cfg->disable_auto_redirect && cfg->method==HTTP_METHOD_POST);
++ assert(cfg->disable_auto_redirect && cfg->method==HTTP_METHOD_POST && cfg->is_async);
 +#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
-+ return new Client{cfg->transport};
++ return new Client{cfg->transport && cfg->transport->wrapper ? *static_cast<Raw **>(cfg->transport->context) : cfg->transport};
 +#else
 + return new Client{nullptr};
 +#endif
 +}
 +void esp_http_client_cleanup(Client *c) { delete c; }
-+int esp_http_client_get_socket(Client *c) { return c->open ? 1 : -1; }
++int esp_http_client_get_socket(Client *c) { return c->open ? c->fd : -1; }
 +int esp_http_client_set_timeout_ms(Client *c,int ms) { c->timeout=ms; return ESP_OK; }
 +void esp_http_client_set_url(Client *,const char *) {}
 +void esp_http_client_set_method(Client *,int) {}
@@ -3676,11 +4064,23 @@ index 0000000..ffb5c3c
 + if(!r->saved) return ESP_ERR_INVALID_STATE; // Public API leaves an old offered pointer intact.
 + r->offered=true; return ESP_OK;
 +}
-+''' + origin + transport + r'''
++''' + origin + transport + '\nint esp_http_client_perform(Client *);\n' + cancellation + r'''
 +int esp_http_client_perform(Client *c) {
-+ ++performed; assert(response_next<responses.size());
-+ Response r=responses[response_next++]; c->status=r.status; latest_ticket=r.ticket; c->open=!r.close;
++ ++performed;
++ if (c->fd>=3) {
++  char byte;
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++  Raw raw,wrapper; raw.fd=c->fd; brain_transport_t t={};t.handle=&raw; wrapper.context=&t;
++  return http_poll_read(&wrapper,&byte,1,30000)<0 && errno==EAGAIN ? ESP_ERR_HTTP_EAGAIN : ESP_OK;
++#else
++  return recv(c->fd,&byte,1,MSG_DONTWAIT)<0 ? ESP_ERR_HTTP_EAGAIN : ESP_OK;
++#endif
++ }
++ assert(response_next<responses.size());
++ Response r=responses[response_next++]; clock_us+=r.advance_us; c->status=r.status; latest_ticket=r.ticket; c->open=!r.close; if(c->raw)c->raw->fd=r.close?-1:1;
++ if(r.cancel) { ++s_gen; }
 + if(r.body) {
++  s_http_progress[c==s_openai_cli ? 0 : 1]++;
 +  http_save_ticket(c);
 +  if(c->tag) s_tts_bytes_total+=100;
 +  else if(s_brain_stream) std::strcpy(s_brain_stream->reply,"reply");
@@ -3695,7 +4095,43 @@ index 0000000..ffb5c3c
 +static void good(bool ticket=true) { responses.push_back({ESP_OK,200,true,ticket}); }
 +int main(int argc,char **argv) {
 + assert(argc==2); std::string mode=argv[1];
-+ if(mode=="idle-schedule") {
++ if(mode=="transport-poll") {
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++  Raw raw,wrapper; brain_transport_t t={}; t.handle=&raw; wrapper.context=&t; char byte=0;
++  for(int result : {0,ESP_TLS_ERR_SSL_WANT_READ,ESP_TLS_ERR_SSL_WANT_WRITE}) {
++   io_result=result; errno=0; assert(http_poll_read(&wrapper,&byte,1,30000)==-1 && errno==EAGAIN && io_wait==50);
++   errno=0; assert(http_poll_write(&wrapper,&byte,1,30000)==-1 && errno==EAGAIN && io_wait==50);
++  }
++  io_result=7; assert(http_poll_read(&wrapper,&byte,1,30000)==7);
++  io_result=-9; assert(http_poll_read(&wrapper,&byte,1,30000)==-9);
++  assert(http_poll_connect(&wrapper,"test",443,30000)==0 && io_wait==500);
++#endif
++ } else if(mode=="async-progress") {
++  for(int i=0;i<4;i++) responses.push_back({ESP_ERR_HTTP_EAGAIN,200,true,true,false,false,15000000});
++  good(); assert(request()); assert(clock_us>=60000000 && performed==5);
++ } else if(mode=="async-timeout") {
++  responses.push_back({ESP_ERR_HTTP_EAGAIN,0,false,false,false,false,6000000});
++  assert(!brain_http_warmup(true)); assert(!s_openai_cli && performed==1);
++ } else if(mode=="cancel-request") {
++  s_turn.phase=P_WAIT_REPLY; s_turn.gen=1; s_gen=1;
++  responses.push_back({ESP_ERR_HTTP_EAGAIN,200,false,false,false,true});
++  assert(!request() && performed==1 && !s_openai_cli);
++  s_turn.gen=2; s_gen=2; good(); assert(request());
++ } else if(mode=="cancel-blocking") {
++  int pair[2]; assert(socketpair(AF_UNIX,SOCK_STREAM,0,pair)==0);
++  s_turn.phase=P_WAIT_REPLY; s_turn.gen=1; s_gen=1;
++  esp_http_client_config_t cfg; cfg.disable_auto_redirect=true; cfg.method=HTTP_METHOD_POST; cfg.is_async=true; s_openai_cli=esp_http_client_init(&cfg); s_openai_cli->fd=pair[0];
++  auto start=std::chrono::steady_clock::now();
++  std::thread cancel([] { std::this_thread::sleep_for(std::chrono::milliseconds(30)); ++s_gen; });
++  assert(brain_http_perform(&s_openai_cli,false)==ESP_FAIL);
++  cancel.join();
++  assert(std::chrono::steady_clock::now()-start<std::chrono::milliseconds(500));
++  assert(performed>=1);
++#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
++  assert(io_wait==50);
++#endif
++  close(pair[0]);close(pair[1]);
++ } else if(mode=="idle-schedule") {
 +  brain_idle_t idle;
 +  clock_us=4999999; brain_idle_maintenance(idle,true,true,false);
 +  assert(performed==0 && speed_taken==0);
@@ -3796,12 +4232,17 @@ index 0000000..ffb5c3c
 +        (out/'http.cpp').write_text(code); cls.binaries=[]
 +        for custom in (0,1):
 +            binary=out/f'http-{custom}'
-+            cmd=[*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-Wall','-Wextra','-Werror',f'-DCONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT={custom}',str(out/'http.cpp'),'-o',str(binary)]
++            cmd=[*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-pthread','-Wall','-Wextra','-Werror','-Wno-unused-function',f'-DCONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT={custom}',str(out/'http.cpp'),'-o',str(binary)]
 +            r=subprocess.run(cmd,capture_output=True,text=True)
 +            if r.returncode: raise AssertionError(r.stdout+r.stderr)
 +            cls.binaries.append(binary)
 +
 +    def test_head_warmup_retains_method_not_allowed_connection(self): self.run_case('warmup')
++    def test_transport_bounds_waits_and_preserves_async_retry(self): self.run_case('transport-poll')
++    def test_active_stream_progress_extends_normal_io_timeout(self): self.run_case('async-progress')
++    def test_head_has_a_bounded_total_deadline(self): self.run_case('async-timeout')
++    def test_cancel_aborts_without_replaying_and_next_request_is_clean(self): self.run_case('cancel-request')
++    def test_cancel_wakes_a_blocked_socket_read(self): self.run_case('cancel-blocking')
 +    def test_idle_timer_and_queued_turn_priority(self): self.run_case('idle-schedule')
 +    def test_keepalive_failure_rewarms_without_a_turn(self): self.run_case('keepalive-failure')
 +    def test_retry_backoff_and_wifi_outage(self): self.run_case('retry-and-wifi')
@@ -3822,10 +4263,10 @@ index 0000000..ffb5c3c
 +                self.assertEqual(r.returncode,0,r.stdout+r.stderr)
 diff --git a/esp32/tests/test_muse_brain_stream.py b/esp32/tests/test_muse_brain_stream.py
 new file mode 100644
-index 0000000..f2df863
+index 0000000..58e4479
 --- /dev/null
 +++ b/esp32/tests/test_muse_brain_stream.py
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,130 @@
 +"""Check short-reply socket reuse and streaming fallback at HTTP boundaries."""
 +import os, shlex, subprocess, tempfile, unittest
 +from pathlib import Path
@@ -3873,6 +4314,7 @@ index 0000000..f2df863
 +static int s_brain_hist_n;
 +static char *s_brain_hist;
 +static void brain_pump_audio() {}
++static bool brain_http_cancelled() { return false; }
 +static std::vector<std::string> chunks;
 +static bool response_complete, speech_fail;
 +static std::vector<bool> shared;
@@ -3956,7 +4398,7 @@ index 0000000..f2df863
 +        r=subprocess.run([str(self.binary),name],capture_output=True,text=True)
 +        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
 diff --git a/esp32/tests/test_muse_chat_session.py b/esp32/tests/test_muse_chat_session.py
-index 7847475..83b2bef 100644
+index 7847475..4df6fef 100644
 --- a/esp32/tests/test_muse_chat_session.py
 +++ b/esp32/tests/test_muse_chat_session.py
 @@ -22,9 +22,14 @@ class ChatSession(unittest.TestCase):
@@ -3974,7 +4416,7 @@ index 7847475..83b2bef 100644
          code = r'''
  #include <cassert>
  #include <cstdint>
-@@ -37,14 +42,18 @@ class ChatSession(unittest.TestCase):
+@@ -37,14 +42,19 @@ class ChatSession(unittest.TestCase):
  #include "minimp3.h"
  #include "muse_chat_priv.h"
  #define ESP_LOGI(...) ((void)0)
@@ -3984,6 +4426,7 @@ index 7847475..83b2bef 100644
 +static const char *test_brain_url = "";
 +static int64_t test_clock = 12345;
 +static void turn_speed(bool) {}
++static void brain_cancel_http() {}
  static char s_reply_shown[EV_TEXT];
  static int64_t s_last_seq, s_marks[4];
  static int captions, console_events;
@@ -3994,7 +4437,7 @@ index 7847475..83b2bef 100644
  static void emit(muse_hatch_ev_t type, const char *) {
      if (type == MUSE_HATCH_EV_REPLY) captions++;
  }
-@@ -54,11 +63,14 @@ bool muse_hatch_caption_at(const char *text, size_t, char *out, size_t cap) {
+@@ -54,11 +64,14 @@ bool muse_hatch_caption_at(const char *text, size_t, char *out, size_t cap) {
      strlcpy(out, text, cap); return text[0];
  }
  static void turn_finish() { s_turn.phase = P_IDLE; }
@@ -4010,7 +4453,7 @@ index 7847475..83b2bef 100644
  static void begin(bool typed = false) {
      assert(turn_start(s_turn.gen + 1, typed));
      s_turn.phase = P_WAIT_REPLY;
-@@ -128,12 +140,40 @@ static void bounded_rejections() {
+@@ -128,12 +141,40 @@ static void bounded_rejections() {
      event("message.assistant", "second", "note", "Second");
      assert(s_turn.nmsgs == 2 && s_turn.msgs[0].done && s_turn.msgs[1].done);
  }
@@ -4051,7 +4494,7 @@ index 7847475..83b2bef 100644
      default: return 2;
      }
  }
-@@ -166,3 +206,9 @@ int main(int argc, char **argv) {
+@@ -166,3 +207,9 @@ int main(int argc, char **argv) {
  
      def test_rejection_capacity_preserves_correlation(self):
          self.run_case(2)
@@ -4206,6 +4649,57 @@ index 0000000..74a1633
 +            restart, dumps = run(0)
 +            self.assertEqual(restart, 363000)
 +            self.assertEqual(dumps, 2)
+diff --git a/esp32/tests/test_muse_speech_guard.py b/esp32/tests/test_muse_speech_guard.py
+new file mode 100644
+index 0000000..e86f215
+--- /dev/null
++++ b/esp32/tests/test_muse_speech_guard.py
+@@ -0,0 +1,45 @@
++import os, shlex, subprocess, tempfile, unittest
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++class SpeechGuard(unittest.TestCase):
++    def test_adaptive_quiet_soft_speech_and_transient_clips(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            out=Path(tmp); src=out/'guard.c'
++            src.write_text(r"""
++#include <assert.h>
++#include "muse_speech_guard.h"
++int main(void) {
++ muse_speech_guard_t quiet={.floor_db=-70};
++ for(int i=0;i<149;i++) muse_speech_guard_feed(&quiet,-69,20);
++ assert(!quiet.speech && !muse_speech_guard_stop(&quiet));
++ muse_speech_guard_feed(&quiet,-69,20);
++ assert(!quiet.speech && muse_speech_guard_stop(&quiet));
++ muse_speech_guard_t pop={.floor_db=-70};
++ muse_speech_guard_feed(&pop,-1,20); // a clipped spike must not become speech.
++ for(int i=0;i<150;i++) muse_speech_guard_feed(&pop,-69,20);
++ assert(!pop.speech && muse_speech_guard_stop(&pop));
++ muse_speech_guard_t repeated={.floor_db=-65};
++ for(int i=0;i<150;i++) muse_speech_guard_feed(&repeated,i%20<3 ? -20 : -64,20);
++ assert(!repeated.speech && muse_speech_guard_stop(&repeated));
++ muse_speech_guard_t brief={.floor_db=-80};
++ for(int i=0;i<4;i++) muse_speech_guard_feed(&brief,-72,20);
++ assert(brief.speech);
++ muse_speech_guard_t soft={.floor_db=-80};
++ for(int i=0;i<10;i++) muse_speech_guard_feed(&soft,-72,20);
++ assert(soft.speech); // very quiet speech, above its local background.
++ for(int i=0;i<150;i++) muse_speech_guard_feed(&soft,-79,20);
++ assert(soft.speech && muse_speech_guard_stop(&soft));
++ muse_speech_guard_t noisy={.floor_db=-45};
++ for(int i=0;i<150;i++) muse_speech_guard_feed(&noisy,-43,20);
++ assert(!noisy.speech && muse_speech_guard_stop(&noisy));
++ muse_speech_guard_t machine={.floor_db=-65};
++ for(int i=0;i<150;i++) muse_speech_guard_feed_vad(&machine,-35,20,false);
++ assert(!machine.speech && muse_speech_guard_stop(&machine));
++ muse_speech_guard_t talk={.floor_db=-65};
++ for(int i=0;i<750;i++) muse_speech_guard_feed(&talk,-56,20);
++ assert(talk.speech && !muse_speech_guard_stop(&talk));
++}
++""")
++            binary=out/'guard'
++            subprocess.run([*shlex.split(os.environ.get('CC','cc')),'-std=c11','-Wall','-Wextra','-Werror','-I',str(ROOT/'components/muse'),str(src),'-o',str(binary)],check=True,capture_output=True)
++            subprocess.run([str(binary)],check=True,capture_output=True)
 diff --git a/esp32/tests/test_muse_voice_note.py b/esp32/tests/test_muse_voice_note.py
 index 8403bec..babb820 100644
 --- a/esp32/tests/test_muse_voice_note.py

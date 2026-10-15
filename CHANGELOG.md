@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.7 — 2026-10-14 — cancel interrupted HTTP work and discard quiet recordings
+
+Interrupting speech now cancels the old generation through asynchronously polled HTTP I/O, including TLS setup. The HTTP owner then discards the old brain/speech clients and decoder buffers. Normal completed turns keep their prepared connections.
+
+- **Cancellation ownership** — use the SDK's asynchronous HTTPS client with 50 ms read/write polls and bounded async connection attempts. Check the generation between I/O attempts. All client/TLS cleanup remains on the owner task. Cancelled requests do not retry, feed more sentences, or upload another STT attempt. Successful data progress preserves long responses; HEAD has a 5 s total budget. No cross-thread TLS-object teardown is needed.
+- **Adaptive quiet guard** — learn the microphone background from median idle levels, require at least 80 ms above that background plus 6 dB to count speech, and end recording after 3 s of continuous quiet once at least 2 s have been captured. ESP32-S3 also checks the existing SDK's lightweight voice classifier, allocated only during recording and freed before STT. Empty recordings return `DIDN'T CATCH THAT` without completing a voice note or invoking STT/chat/TTS. A brief clipped spike does not qualify as speech.
+- **Keep the next wake usable** — a discarded quiet recording does not arm the wake cooldown. Normal wake, captions, meters, no-start-chirp design, keepalive, CPU locks and stall recovery remain.
+- **Validation** — silence exits after 3 s without STT; three interrupted requests cancel in 9–18 ms. Subsequent voice turns take 3.1/3.2/4.0 s, so the strict ≤3 s target remains unmet. Typed controls take 2.8/2.1/2.2 s without new TLS. Watcher/AIPI builds, 260 host tests (2 environment skips), final HTTP checks and clean SDK patch application pass. [Device results and limits](docs/REFERENCE.md#interruption-and-quiet-recordings).
+
 ## v0.2.6 — 2026-10-14 — keep the brain connection ready while idle
 
 The brain HTTP client now receives a HEAD probe every **180 seconds** while idle and Wi-Fi is available. A dead connection is discarded and rebuilt in the background, rather than waiting for the next question. Existing battery Wi-Fi nap remains; probes pause while its radio is off.

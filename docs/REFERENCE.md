@@ -150,11 +150,41 @@ PTT release → record finalized (min 0.3 s, else "DIDN'T CATCH THAT")
 
 Short replies can use one session: after the chat HTTP response is fully consumed, speech reuses its client when HTTPS authority and pinned roots match. Replies up to 128 UTF-8 bytes are batched for one speech request; longer replies use a separate speech client while chat continues streaming. `perform()` and its data callback retain the client state correctly; the manual `open()` path in IDF 6 started a new connection each turn. A stale socket gets one immediate retry before any reply data arrives. TLS 1.3 tickets are saved after reading response headers and scoped to the provider origin; changing hosts discards the old ticket. A HEAD request prepares the connection after Wi-Fi becomes ready (and before recording if no client exists); a 405 response is expected for a POST-only transcription endpoint and still establishes authenticated TLS.
 
+## Interruption and quiet recordings
+
+Cancellation used to change only the generation counter and enqueue a command. The same task was running blocking HTTP requests, so it could not handle the command until the fetch returned. The final implementation uses ESP-IDF's asynchronous HTTPS client, with the HTTP owner checking cancellation between I/O attempts, including TLS setup. Producers signal cancellation through the generation and queued command. The owner closes and frees old HTTP/TLS clients, resets decoder state and drains queued audio before processing the next turn. Successful ordinary turns retain their keepalive clients.
+
+The custom SSL transport bounds each socket read/write wait to 50 ms (TCP connection attempts use up to 500 ms) and maps an idle poll to `EAGAIN`, so IDF does not mistake a gap between body chunks for a truncated response. Normal requests keep a 30-second no-progress timeout, extended by successful connection/header/data events so a healthy long response can continue. HEAD preparation and maintenance use a five-second total budget. Cancelled requests skip retries and stop feeding further chat/TTS data.
+
+The microphone guard uses the idle microphone's adaptive background rather than a fixed absolute volume threshold. Speech needs at least 80 ms continuously above background plus 6 dB, which rejects isolated clipping while allowing quiet speech above a quiet local background. Three seconds of continuous quiet ends capture after at least two seconds of captured audio. If no speech was detected, the recording is cancelled and discarded, captioned `DIDN'T CATCH THAT`, and is not passed to STT/chat/TTS. Brain-mode initial HEAD preparation may still occur; it contains no microphone audio and runs no model.
+
+On ESP32-S3, the guard also requires the existing ESP-SR lightweight VAD to report voice. Its state uses about 0.8 KB during recording and is freed before STT; it is primed with available pre-roll. If allocation headroom is insufficient, it logs classifier unavailability and uses the energy guard. Other targets use the energy guard. Voice classification is imperfect, and nearby speech or playback can still qualify. Unit tests cover quiet backgrounds, higher steady background noise, low-volume speech and isolated clipped spikes. Socket-pair tests exercise a waiting nonblocking read and verify prompt cancellation. Other tests verify no replay after cancellation, a clean subsequent request, bounded HEAD preparation, and sustained progress on a response lasting longer than 30 seconds.
+
+Final Watcher device checks on 2026-10-14, with the UART logger as the sole reader and the ordinary acoustic `k` path:
+
+| Check | Observed result |
+| --- | --- |
+| Boot preparation | HEAD completed at uptime 8.151 s. |
+| Idle maintenance | `brain: keepalive ok` at uptime 263.736 s, about 180 s after the final background preparation, without reconnecting or rebooting. A subsequent typed query completed in 2.9 s without a new TLS connection. |
+| PTT without speech | Captured 3.00 s, discarded; no STT/chat/TTS. |
+| Three playback interruptions followed by silence | Old turn cancelled in 18/9/16 ms; each new capture stopped after 3.00 s and was discarded without STT. |
+| Normal `k` immediately after those discarded captures | `turn done` 3.1/3.2/4.0 s; `reply audio after` 2.83/2.93/3.78 s. All produced normal speech. |
+| First normal `k` after boot and the initial silence check | `turn done` 4.9 s, including about 3.18 s from finalized recording to STT response. |
+| Lower-volume acoustic replay | Volume 90: captured RMS -25.9 dBFS, about 4.4 dB below normal replay; accepted, `turn done` 3.3 s. Volume restored to 100. This is not a human whisper test. |
+| Three typed controls | 2.8/2.1/2.2 s; no new TLS connection on any question path. |
+| Post-test health | `>tasks` returned its dump. Idle heartbeat reports remained about 5 KB internal free / 2 KB largest block, with 1553 KB PSRAM free before and after the repeated turns; these rounded readings are not a long-duration leak test. |
+
+**The strict next-turn ≤3 s acceptance criterion is not met.** The silent hallucination path is blocked and cancellation is prompt, but the three valid follow-up voice samples above include a 4.0 s turn. Their TTS-request-to-first-MP3 intervals were 626/604/1436 ms. The original 25 s symptom did not recur in these checks; that is not proof of its original cause. The existing peripheral/DMA stall issue and its v0.2.5 reboot fallback remain separate limitations.
+
+Watcher (wake enabled) and AIPI (wake disabled) builds pass. The full host suite ran 260 tests with two environment skips; the final 19 HTTP checks also pass after adjusting the connection wait. The regenerated binary patch applies through `apply.sh --preset quicksilver` to a clean SDK at `812c46f` using a fake provider key. `muse-serial` was restored after flashing/testing.
+
+The original `timing tts` mark records when the TTS request starts, not its first byte; it does not establish that TTS itself spent 25 seconds blocked. The cancellation change addresses outstanding HTTP ownership, while the quiet guard prevents the silent follow-up from reaching any model.
+
 ## Idle connection maintenance
 
 The brain client sends an authenticated HEAD to its STT endpoint (or chat endpoint if no STT URL is configured) every 180 seconds when no turn is active and no command is queued. This does not run a transcription or model inference. The existing connection is actually probed; the old warmup fast path that only checked whether a client existed cannot mask a dead socket.
 
-Probes run on the HTTP owner's task, with the existing CPU maximum-frequency lock held during the request, including a possible 40 MHz resting configuration. A 405 response is expected at the POST-only transcription endpoint. A failed request or closed socket clears preparation and destroys the stale client and transport. Preparation retries automatically after one second, with exponential backoff capped at 60 seconds. HEAD uses a 5-second I/O timeout; subsequent normal requests reset their timeout to 30 seconds. A synchronous probe already in progress can briefly delay a newly queued command, although active or already-queued turns prevent a probe from starting.
+Probes run on the HTTP owner's task, with the existing CPU maximum-frequency lock held during the request, including a possible 40 MHz resting configuration. A 405 response is expected at the POST-only transcription endpoint. A failed request or closed socket clears preparation and destroys the stale client and transport. Preparation retries automatically after one second, with exponential backoff capped at 60 seconds. HEAD uses a 5-second I/O timeout; subsequent normal requests reset their timeout to 30 seconds. A probe already in progress can briefly delay a newly queued command, although active or already-queued turns prevent a probe from starting.
 
 Both awake idle and resting idle are covered while Wi-Fi is available. The original battery policy turns Wi-Fi off after two minutes of low-power rest, which is shorter than the keepalive interval; connection maintenance does not force the radio back on. It resumes when Wi-Fi returns. Resting queue waits are finite and follow the deadline, with an offline check at most once per minute.
 
