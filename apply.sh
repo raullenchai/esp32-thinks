@@ -72,6 +72,24 @@ case "$PRESET" in
     read -r -p "QuickSilver API key: " KEY
     TTS_KEY="$KEY"; CHAT_KEY="$KEY"
     ;;
+  openmuse)
+    echo "== preset: openmuse — QuickSilver STT/TTS + your own openmuse agent (weather/time/memory/search)"
+    echo "   https://github.com/raullenchai/openmuse — deploy once, fill in the URL"
+    TTS_URL="https://api.quicksilverpro.io/v1/audio/speech"
+    TTS_MODEL="chatterbox-turbo"; TTS_VOICE=""
+    TTS_MODEL_CJK="qwen3-tts"
+    STT_URL="https://api.quicksilverpro.io/v1/audio/transcriptions"
+    STT_MODEL="whisper-large-v3-turbo"
+    STT_ADPCM=1
+    ask() { read -r -p "$1 [$2]: " V; echo "${V:-$2}"; }
+    CHAT_URL=$(ask "openmuse base URL (https://openmuse.<you>.workers.dev/v1)" "")
+    CHAT_MODEL="qwen3.7-flash"                  # placeholder; openmuse overrides the upstream model
+    TTS_CA="ISRG_CA"; BRAIN_CA="ISRG_CA"
+    read -r -p "QuickSilver API key (STT/TTS): " KEY
+    TTS_KEY="$KEY"
+    read -r -p "openmuse token [same as QuickSilver key]: " K
+    CHAT_KEY=${K:-$KEY}
+    ;;
   custom)
     echo "== preset: custom — enter each endpoint (return = keep the OpenAI default shown)"
     ask() { read -r -p "$1 [$2]: " V; echo "${V:-$2}"; }
