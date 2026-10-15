@@ -8,7 +8,7 @@
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-green"></a>
   <img alt="ESP-IDF v6.0.1" src="https://img.shields.io/badge/ESP--IDF-v6.0.1-blue">
   <img alt="board" src="https://img.shields.io/badge/board-SenseCAP%20Watcher-black">
-  <a href="https://github.com/raullenchai/esp32-thinks/pull/2"><img alt="v0.2" src="https://img.shields.io/badge/status-v0.2.1-orange"></a>
+  <a href="https://github.com/raullenchai/esp32-thinks/pull/2"><img alt="v0.2" src="https://img.shields.io/badge/status-v0.2.7-orange"></a>
 </p>
 
 **A multi-model Muse — a personal AI assistant on ESP32, talking out of the box.**
@@ -24,18 +24,33 @@ No vendor lock on the brain: **speech, transcription and chat are three independ
 
 Cloud assistants rent you a brain: one vendor's models, one vendor's pricing, one vendor's uptime, and your voice on their servers. The gadget hardware is fine — the lock is in the firmware.
 
-esp32-thinks flips that. The device runs **your** stack: pick the cheapest transcription, the smartest chat model, the voice you like — per task, changeable in one config line and a rebuild. The whole pipeline is ~1,600 lines of patch against a stock open-source SDK, so it stays yours to read, tweak, or point at a local server.
+esp32-thinks flips that. The device runs **your** stack: pick the cheapest transcription, the smartest chat model, the voice you like — per task, changeable in one config line and a rebuild. The whole pipeline is ~2,600 lines of patch against a stock open-source SDK, so it stays yours to read, tweak, or point at a local server.
+
+## Performance (measured on device)
+
+| Metric | Stock Muse cloud | esp32-thinks v0.2.7 |
+|---|---|---|
+| Voice turn — you stop talking → first word | ~6–10 s | **2.8–3.5 s** (first turn after boot: ~3.4 s) |
+| Typed turn (serial console) | — | **1.9–2.6 s** cold or warm |
+| STT upload | full PCM WAV | **¼ size** (IMA ADPCM in a WAV container) |
+| TLS setup | handshake per turn | **long-lived connection** — prepared at boot, kept warm by a 180 s probe, TLS 1.3 session resumption on reconnect; a dead connection is rebuilt in the background, never on the question path |
+| Interrupt a reply (press PTT) | — | in-flight HTTP work cancelled in **< 20 ms**; the next turn stays fast |
+| Silence after an interrupt | records the full window, uploads noise | recording exits after **~3 s** of quiet, nothing is uploaded |
+| Wedge (rare DMA fault) | hangs until power cycle | full task dump, then **auto-reboot ≈ 24 s** |
+
+Measured on the QuickSilver preset (qwen3.7-flash + whisper-large-v3-turbo + qwen3-tts/chatterbox) over Wi-Fi. Details: [LATENCY-v0.2.4](docs/LATENCY-v0.2.4.md) · [STABILITY-v0.2.5](docs/STABILITY-v0.2.5.md) · [REFERENCE §idle maintenance](docs/REFERENCE.md#idle-connection-maintenance).
 
 ## What you get
 
 - **Wake word + button** — say "Hi, ESP" (esp-sr WakeNet10, runs on-chip) or hold the knob; both start a turn. Wake turns end on a voice-activity timer; the button works exactly like before.
 - **Bring your own brain** — three independent OpenAI-compatible endpoints (STT / chat / TTS) in one config file. Mix providers freely; presets: `openai`, `quicksilver`, `custom`.
 - **Streaming voice replies** — the chat stream is parsed at sentence boundaries (ASCII + CJK); each sentence is synthesized the moment it lands and appended to the audio already playing. First word arrives while the model is still generating.
-- **Faster answers** — voice reply starts **≈ 3.4 s after recording**, typed turns finish **2.2–2.6 s**. Connections prepare after Wi-Fi is ready; [v0.2.4 receipts](docs/LATENCY-v0.2.4.md) include first-after-boot and warm samples.
-- **Automatic stall recovery** — outstanding I2S or LCD work gets a 20 s deadline, followed by the existing task dump and reboot. Normal sleep and cloud response time do not use that deadline. [Stability checks](docs/STABILITY-v0.2.5.md).
+- **Long-lived brain connection** — TLS is prepared before you ask, probed every 180 s while idle, and resumed with session tickets after an idle close. Latency doesn't depend on how long the device sat.
+- **Barge-in** — press the knob while Muse is speaking: the reply stops mid-sentence, in-flight requests are cancelled, and your next words start a fresh turn immediately.
+- **Silence guard** — a quiet recording (interrupted turn, pocket press) is discarded instead of becoming a hallucinated answer.
+- **Automatic stall recovery** — outstanding I2S or LCD work gets a 20 s deadline, followed by a zero-allocation task dump and reboot. Normal sleep and slow cloud responses don't count as stalls.
 - **Language-aware voice** — Chinese turns can use a different (better) TTS model than English ones, picked automatically from the transcript.
 - **Headless provisioning** — put your Wi-Fi in the config; the device self-provisions on boot. No app, no BLE dance, no vendor account needed.
-- **Silence-trimmed uploads** — recordings are trimmed to speech before upload, shaving ~0.5 s off transcription.
 - **Typed turns speak too** — the serial console path gets the same treatment (useful for testing without talking).
 
 ## At a glance
@@ -79,13 +94,51 @@ With a preset + headless Wi-Fi in step 2, that's the whole setup: unplug, re-plu
 | `./build-and-flash.sh <sdk> [port]` | `idf.py build` + paced flash (firmware + wake-word model); never interrupt it |
 | `python3 scripts/tts_probe.py <sdk> [port] ["question"]` | End-to-end test over the serial console |
 
+## How a turn flows
+
+```
+ "Hi, ESP" / knob ──▶ record (pre-roll holds the last second)
+                        │  ends: voice VAD (~1.4 s silence) or knob release
+                        ▼
+              trim to speech ──▶ POST WAV/ADPCM ─▶ STT endpoint
+                        │                         (¼-size upload, keep-alive)
+                        ▼
+              POST /chat/completions (SSE) ──────────────▶ chat endpoint
+                        │  split at sentence boundaries (ASCII + 。！？…)
+                        ▼
+              per sentence: POST /audio/speech ─▶ MP3 appends to the buffer
+                        │                          already decoding + playing
+                        ▼
+                 first word out loud while the model is still writing
+```
+
+- **Connection care is off the critical path**: the first TLS handshake happens after Wi-Fi comes up (and before a recording if needed), a HEAD probe re-checks the client every 180 s while idle, and tickets enable TLS 1.3 resumption. A keep-alive FIN surfaces as an empty 200 and gets one transparent retry before any reply data has started.
+- **Short replies** (≤ 128 UTF-8 bytes) reuse the completed chat connection for speech; longer replies stream sentences on a separate speech connection. Each endpoint pins its own root CA, and tickets never cross origins.
+- On-device the screen follows the turn: **listening** (mic accent + level meter) → **thinking** (ring spinner, caption shows the transcript) → **speaking** (level follows the audio, caption follows the text).
+
+Latency receipts (warm, QuickSilver preset, measured on device): voice turn ≈ 2.8–3.5 s to first word, typed turn 1.9–2.6 s end-to-end. Cold boot adds ~0.5–1 s for the first connection, which is prepared before you can ask. See [REFERENCE](docs/REFERENCE.md) for the full breakdown and every gotcha.
+
+## Serial console
+
+The USB serial port (`/dev/ttyACM1`) is a full console, handy for bench testing:
+
+| Input | Does |
+|---|---|
+| hold knob / `d`…`u` | simulate PTT down/up |
+| `k` | self-test: plays the wake phrase through the speaker, then a full voice turn |
+| `>chat=hello?` | typed turn — same brain path, spoken reply |
+| `>tasks` | dump every task backtrace (works even while wedged) |
+| `>status` | heartbeats: Wi-Fi, heap, DMA, tunnel |
+| `z` / `w` | sleep / wake |
+| `p` | screenshot over serial |
+
 ## Built on muse-gadget-sdk
 
 Credit where it's due — and clarity about the split:
 
 **Theirs** (upstream, untouched behavior): the device framework, LVGL UI and round-LCD drivers, audio stack (codec, resampler, minimp3), input/console plumbing, OTA and partitioning. This recipe targets the SDK at a pinned commit so patches apply cleanly.
 
-**Ours** (`patches/muse-brain.patch`): the brain session (`muse_chat_session.cpp` — three-endpoint config, SSE sentence streaming, TTS pipeline, keep-alive TLS), the wake-word integration (`muse_voice.c` — direct WakeNet10 on idle chunks, wake→PTT synthesis, VAD end-of-turn, cooldown), the `model` flash partition and the esp-dl kernel fix, plus the tooling (`apply.sh`, `build-and-flash.sh`, NVS backup, probes).
+**Ours** (`patches/muse-brain.patch`): the brain session (`muse_chat_session.cpp` — three-endpoint config, SSE sentence streaming, TTS pipeline, connection warm-up + idle probes, turn cancellation), the wake-word integration (`muse_voice.c` — direct WakeNet10 on idle chunks, wake→PTT synthesis, VAD end-of-turn, quiet-recording guard, stall coroner), the `model` flash partition and the esp-dl kernel fix, plus the tooling (`apply.sh`, `build-and-flash.sh`, NVS backup, probes).
 
 Nothing else from the Muse cloud is required: the vendor agent works as an optional fallback (its token is optional), and with headless provisioning the device never contacts it.
 
@@ -102,22 +155,12 @@ Everything lives in `esp32/components/muse/provider_config.h` (written by `apply
 | `BRAIN_STT_URL` / `BRAIN_STT_MODEL` | Transcription endpoint (shares the chat key) |
 | `BRAIN_CHAT_URL` / `BRAIN_CHAT_KEY` / `BRAIN_MODEL` | Chat endpoint; leave the URL empty to use the Muse cloud agent |
 | `BRAIN_CHAT_EXTRA` | Extra JSON merged into the chat body (provider quirks, e.g. DeepSeek's `reasoning.exclude`) |
-| `BRAIN_SYSTEM` | The assistant's persona / system prompt |
+| `BRAIN_SYSTEM` | The assistant's persona / system prompt — keep it to one short sentence for snappy replies |
 | `WAKE_WORD` | `1` = "Hi, ESP" wake word + button; `0` = button only |
 | `WAKE_VAD_DB` | End-of-turn silence threshold for wake turns (raise toward -35 if it keeps recording after you stop) |
 | `DEV_WIFI_SSID` / `DEV_WIFI_PASS` | Headless provisioning; empty = normal BLE setup |
 
 Changed a define? Re-run `./build-and-flash.sh` — it rebuilds and reflashes.
-
-## How a turn flows
-
-1. **Wake or press** → "Hi, ESP" (or the knob) starts recording; the pre-buffer already holds the last second of audio. A wake turn ends after ~1.4 s of silence; a button turn ends on release.
-2. **You stop talking** → the recording is trimmed to speech and POSTed as multipart WAV to the transcription endpoint (keep-alive).
-3. **The transcript opens an SSE chat stream** → the parser splits the reply at sentence boundaries (`.!?` and CJK `。！？…`), so Chinese works too.
-4. **Each sentence POSTs to the speech endpoint** → the MP3 is appended to the audio buffer already being decoded and played. A reserved message slot lets captions and speech interleave with the stream.
-5. **Completed short replies reuse the chat connection for speech** when provider origin and root trust match. Replies up to 128 UTF-8 bytes are synthesized together; longer replies stream on a separate speech connection. A HEAD request prepares the first TLS connection after Wi-Fi is ready, and before a voice recording when needed. An idle HEAD probe every 180 seconds checks the same client while Wi-Fi stays up; failure triggers background preparation with bounded backoff. Battery Wi-Fi nap pauses probes. Clients retain keep-alive connections and save TLS 1.3 tickets after reading headers, so an idle-close reconnect can resume the session.
-
-Latency receipts (warm, measured on device, QuickSilver preset): transcription 3.4 s, first spoken word ≈ 5–7 s after you stop; the text caption shows at ~2–3 s. Cold adds ~1.5 s. See [REFERENCE](docs/REFERENCE.md) for the full breakdown and every gotcha.
 
 ## Security notes
 
@@ -130,6 +173,7 @@ Latency receipts (warm, measured on device, QuickSilver preset): transcription 3
 - More boards the SDK supports (Waveshare, M5Stack…).
 - Full-duplex speech-to-speech models (e.g. QuickSilver's qwen3.8-omni) and local LLMs on your LAN — the brain is just three URLs.
 - Custom wake phrases ("Hey Mica") via Espressif's TTS Pipeline V3.
+- Echo-proof wake word (speaker audio must never re-trigger the device), and a root-cause fix for the rare DMA event loss behind the stall reboot.
 
 Full story, exact code paths and every gotcha found the hard way: **[docs/REFERENCE.md](docs/REFERENCE.md)**.
 
