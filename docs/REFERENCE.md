@@ -2,28 +2,26 @@
 
 The full story of **esp32-thinks** — a multi-model Muse: a personal AI voice assistant on ESP32 with a brain you choose (three independent OpenAI-compatible endpoints) and an on-chip wake word. This document follows the project's timeline: the v0.1 TTS hook, the v0.2 brain, and the v0.2.1 wake word — with every gotcha found the hard way along the way. For the pitch and the quick start, see the [README](../README.md).
 
-Everything here was learned on real hardware. Tested with **muse-gadget-sdk @ `812c46f`** (2026-10-09) and **ESP-IDF v6.0.1** on an esp32s3 target. Newer revisions likely work — run `git rev-parse --short HEAD` in the SDK to compare.
+Current release behavior is described first; versioned receipt sections retain their original measurement conditions. Tested with **muse-gadget-sdk @ `812c46f`** (2026-10-09) and **ESP-IDF v6.0.1** on an esp32s3 target. Use that exact SDK revision for reproducible patch application; newer revisions are not validated.
 
 ## What the patch changes
 
-Three files in `esp32/components/muse/`, all in the SDK's own extension points:
+The cumulative patch includes firmware, configuration and host tests:
 
-- **`muse_chat_session.cpp`**
-  - `tts_fetch_openai()` + `tts_http_event()`: POSTs the reply text to `https://api.openai.com/v1/audio/speech` (`response_format: mp3`), streaming the response into the SDK's existing `tts_data()` buffer (512 KB in PSRAM) and calling `decode()` per chunk — the device speaks while the MP3 is still downloading. The fetch logs its duration (`TTS ok: N bytes in X ms`).
-  - `start_tts()`: for a `TTS_QUEUED` message with text, sets up the documented TTS state (`mp3dec_init`, `silent = false`, …) and calls the fetch. On failure it falls back to the stock caption-paced silence, so a dead API key degrades to captions instead of a hung turn.
-  - `message_done()`: the typed-turn branch (`s_turn.text`) returned before ever setting `TTS_QUEUED` — captions only by design. The patch makes the final text authoritative (copying it over partial accumulated text when they disagree) and queues TTS for both typed and voice turns.
-  - `#define TTS_API_KEY / TTS_MODEL / TTS_VOICE` — your knobs.
-- **`CMakeLists.txt`** — `EMBED_TXTFILES "openai_root_ca.pem"` (the pinned CA).
-- **`muse_voice.c`** — a boot melody after `muse_audio_init()`: a synthesized chirp chain, so speaker-chain problems are obvious one second after power-on. Plus a reply-audio level log.
+- `muse_chat_session.cpp`: independent STT/chat/TTS endpoints, streaming replies, language routing, persistent HTTPS, background preparation/probes and cancellation.
+- `muse_voice.c` and speech/wake guard headers: recording, adaptive no-speech rejection, direct WakeNet integration, speaker/cooldown gates and turn recovery.
+- `muse_audio.c`, `muse_io_watch.*` and LCD send hooks: playback activity tracking and bounded stall detection. A peripheral deadline leads to a diagnostic dump and restart; the underlying DMA fault is not resolved.
+- `CMakeLists.txt`, component dependencies, SDK defaults and partitions: public root CAs, ESP-SR model support and the wake-model partition.
+- Host tests: HTTP cancellation/reuse, speech/wake boundaries, empty STT, language multipart fields, Chinese/Korean TTS routing and the existing SDK suite.
 
-The decode path needs no changes: `decode()` reads the MP3 frame header, sees 24 kHz, and `resampler_init(&s_turn.down, info.hz, MIC_RATE)` handles the 24→16 kHz conversion. Captions follow the played frames automatically.
+The existing MP3 decoder and resampler handle speech output. Typed console turns fetch and decode TTS but drain PCM without speaker playback; use a real voice turn for acoustic checks.
 
 ## Prerequisites
 
 - **Build host**: Linux or macOS with ESP-IDF **v6.x** for esp32s3. The conventional layout is `~/esp/esp-idf-v6`; set `IDF_PATH` if yours differs. (During install, run `install.sh esp32s3`; if the Python installer stalls, `bash install.sh esp32s3`.)
 - **Hardware**: Seeed SenseCAP Watcher W1-B + a USB-C data cable. It enumerates as a CH342 dual serial: `ttyACM0` is the Himax camera core, **`ttyACM1` is the ESP32-S3** (the one for flashing and the console). On macOS pick the matching `/dev/tty.usbmodem*`.
-- **Muse gadget token**: create a gadget at [gadgets.muse.ai](https://gadgets.muse.ai) (free), copy the `mgst_…` token.
-- **OpenAI API key**: needs `audio/speech` access. `tts-1` is ~$15 per 1M characters — a typical reply is 50–200 chars, so daily use costs fractions of a cent.
+- **Provider access**: keys for the configured STT, chat and MP3 speech endpoints. Choose `openai`, `quicksilver` or `custom` in `apply.sh`. Billing and model availability depend on the provider.
+- **Muse gadget token**: optional. Leave it empty for the independent brain; supply one only if you also want the stock Muse agent fallback.
 
 ## Before the first flash: back up the factory NVS
 
@@ -53,47 +51,47 @@ python3 ../tools/muse/paced_esptool.py --chip esp32s3 -p /dev/ttyACM1 -b 115200 
 Two non-negotiables:
 
 - **Use `paced_esptool`, not plain `esptool`.** The CH342 USB bridge drops whole packets at high baud; the paced tool writes at 115200 with inter-chunk pacing. Plain high-baud flashes come out silently corrupt.
-- **Never interrupt a flash.** Half-written partitions are exactly what the NVS backup is for. The last line should be `Hard resetting via RTS pin...` and you'll hear the boot melody.
+- **Never interrupt a flash.** Half-written partitions are exactly what the NVS backup is for. The last line should be `Hard resetting via RTS pin...`; the normal brain build has no startup melody.
 
 Changed `TTS_VOICE`/`TTS_MODEL`/the token? Just re-run `build-and-flash.sh` — the incremental build is fast. Changed anything in `SDKCONFIG_DEFAULTS` (e.g. the CJK font)? Delete `build-muse-sensecap-watcher/sdkconfig` first so it regenerates.
 
 ## Provisioning & pairing
 
+For a new device, `apply.sh` can compile headless Wi-Fi credentials and a placeholder token into the firmware. Existing saved Wi-Fi takes precedence. No Muse account is required for the independent brain. To use the optional stock setup path:
+
 1. Wi-Fi: serve `muse-gadget-sdk/esp32/tools/muse/ble_setup.html` over localhost (`python3 -m http.server 8000`), open it in Chrome, and pair over WebBLE to the device (`MuseGadget-XXXXXX`). It hands the credentials to the board.
 2. Account: the Muse app (phone) binds the device to your Muse account — the gadget token in `sdkconfig.token.local` is what your firmware presents.
 3. Verify: `python3 muse-gadget-sdk/esp32/tools/muse/chat.py --status` → expect `state: 'Connected'`, `link: Online`, and your SSID.
 
-By default this is a **push-to-talk** device — press the knob, talk, release, intercom style. `apply.sh` can also enable the **"Hi ESP" voice wake word** (see below); button and wake word then both start a turn.
+The knob always supports push-to-talk: press, speak and release. `apply.sh` enables the **"Hi ESP" wake word** by default; answer `n` for button-only operation.
 
 ## How the spoken reply flows
 
-```
-PTT press → mic frames (16 kHz) → hatch upload (STT in the cloud)
-  → agent reply arrives on the /chat/subscribe stream as message events
-  → text accumulates per message; on message_done the message is TTS_QUEUED
-  → start_tts() sets up mp3dec + pcm accounting, silent = false
-  → tts_fetch_openai() POSTs the text, streams MP3 chunks into tts_data()
-  → decode() minimp3-decodes, resamples 24k→16k, feeds the speaker stream buffer
-  → captions follow the played frames; turn ends when drained
+```text
+PTT / wake → record 16 kHz mono → qualified-speech guard
+  → trim and upload WAV (QuickSilver: IMA ADPCM)
+  → automatic STT language detection → chat SSE stream
+  → completed sentences → MP3 speech endpoint
+  → decode and resample → speaker + caption
 ```
 
-Failure modes are graceful: a non-200 or a dropped connection resets the state and falls back to caption-paced silence — the turn still ends, the reply still shows.
+Empty STT text is an explicit discard. Transport or malformed-response failures retain the existing saved-note retry behavior. Normal completed turns keep their HTTPS clients; cancellation invalidates in-flight HTTP ownership before the next turn.
 
 ## Changing voice / model
 
-Edit `TTS_VOICE` / `TTS_MODEL` in `muse_chat_session.cpp`, re-run `build-and-flash.sh` — or set the voice once at `apply.sh` time (it prompts). Voices that read Chinese well: `alloy`, `nova`, `shimmer`, `echo`, `onyx` (see OpenAI's voice list). `gpt-4o-mini-tts` also works and accepts style instructions — wire the prompt in yourself if you want a persona.
+Edit `TTS_VOICE`, `TTS_MODEL` or `TTS_MODEL_CJK` in the generated `esp32/components/muse/provider_config.h`, then rebuild and flash. Set `BRAIN_SYSTEM` there to customize the persona. `apply.sh` supplies defaults; it must be run against an unpatched SDK checkout, not rerun over an already applied patch.
 
-**Where the latency goes** (measured on a Watcher over 2.4 GHz Wi-Fi): Muse's cloud STT + LLM take ~5–8 s and are outside this recipe's control (swap the agent/backend for real gains); the TTS hop adds ~1–2 s to first sound with streaming enabled — TLS handshake to `api.openai.com` dominates it. Sentence-level TTS (speaking while the LLM is still writing) is a possible future cut, but replies are usually 1–3 sentences and the win is small.
+The QuickSilver preset uses chatterbox-turbo for English and qwen3-tts for Chinese/Korean text. Voice availability and language quality depend on the selected provider. Longer replies can require a separate speech connection and take longer to synthesize; historical short-answer latency is not a promise for the current persona.
 
 ## Swapping the brain
 
-Nothing in the TTS path knows which agent produced the text — it fires on `TTS_QUEUED`. Point your Muse gadget at any backend the hatch supports and it still speaks. The natural next steps (not in this recipe yet): a self-hosted agent behind the SDK's home-network tunnel, local TTS on a box in the same LAN, wake word, other boards (the SDK supports Waveshare, M5Stack and more — the patch is in the board-agnostic `muse` component).
+Set the independent URLs/models/keys in `provider_config.h`, with the matching pinned public roots. Endpoints can share one provider or use different services. An empty `BRAIN_CHAT_URL` selects the optional stock Muse agent instead. Local OpenAI-compatible services may also be used when their transport and formats meet the firmware's requirements.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `No matching trusted root certificate found` → `TTS failed` | You skipped `apply.sh` (no pinned CA) or applied to a different tree | Re-run `apply.sh`, rebuild |
+| `No matching trusted root certificate found` → `TTS failed` | Missing or incorrect pinned CA | Check the generated CA selection; apply the recipe to a clean SDK if files are missing, then rebuild |
 | `TTS failed: 0 audio bytes buffered`, no other error | Bad key (401), no route to `api.openai.com`, or the reply text was empty | Check the key; `tts_probe.py` prints the console log |
 | **No sound at all, but captions show** | Speaker off / volume 0 in device settings; or TTS failed silently (see above) | Settings → Speaker on, volume up; watch the console during a turn |
 | `device reports readiness to read but returned no data` | Two processes on `/dev/ttyACM1` (monitor + probe/chat) | One serial client at a time |
@@ -107,9 +105,9 @@ The console is your friend for all of these: `python3 muse-gadget-sdk/esp32/tool
 
 ## Security
 
-- **Your OpenAI key is compiled into the firmware** (and the Muse token into NVS). On a shelf at home that's fine — the device is not exposed to the internet beyond its own outbound connections. Don't gift or re-sell the device with your keys inside: `write-flash 0x9000 <factory-nvs-backup>` restores the factory partition, and a fresh `idf.py erase-flash` clears the app image.
+- **Provider keys and optional provisioning credentials are compiled into the app image.** NVS can also hold Wi-Fi and Muse credentials. Restoring factory NVS alone does not remove keys from the app. Before transferring the device, remove the credential-bearing app and saved settings, then flash a configuration intended for its recipient. Do not publish built binaries containing your keys or factory NVS backups.
 - The pinned CA is a public Google Trust Services root (GTS Root R4, self-signed, valid to 2036). Nothing secret in it; it's pinned because the ESP x509 bundle doesn't carry it.
-- The `tts_probe.py` traffic is device → `api.openai.com` over TLS with that pinned root, plus the SDK's own noise-encrypted channel to the Muse hatch.
+- Provider requests originate from the device and use the configured endpoints and pinned roots. The independent brain does not require a Muse cloud session. The stock agent channel remains optional.
 
 ## Hardware notes
 
@@ -127,16 +125,28 @@ Three independent OpenAI-compatible endpoints, configured in `provider_config.h`
 
 | Endpoint | Firmware entry | Notes |
 |---|---|---|
-| Speech | `TTS_URL` / `TTS_MODEL` / `TTS_VOICE` (+ `TTS_MODEL_CJK`) | Text → MP3. `TTS_MODEL_CJK` is auto-selected when a turn's text contains CJK ideographs (U+4E00–9FFF). |
-| Transcription | `BRAIN_STT_URL` / `BRAIN_STT_MODEL` | Multipart WAV POST; shares the chat key. |
+| Speech | `TTS_URL` / `TTS_MODEL` / `TTS_VOICE` (+ `TTS_MODEL_CJK`) | Text → MP3. The optional `TTS_MODEL_CJK` is selected for Chinese/Korean reply text using the existing UTF-8 lead-byte heuristic (E4–ED), not a full language classifier. |
+| Transcription | `BRAIN_STT_URL` / `BRAIN_STT_MODEL` | Multipart WAV POST; shares the chat key. Empty `BRAIN_STT_LANG` / `BRAIN_STT_PROMPT` omit both optional fields for auto-detection. |
 | Chat | `BRAIN_CHAT_URL` / `BRAIN_MODEL` (+ `BRAIN_CHAT_EXTRA`) | SSE streaming; empty URL falls back to the stock Muse cloud agent. |
 
 Each endpoint pins its own root CA (`OPENAI_CA` = GTS Root R4 for api.openai.com, `ISRG_CA` = Root YE + ISRG Root X1 for Let's Encrypt hosts). `provider_config.h` also carries `DEV_WIFI_SSID`/`DEV_WIFI_PASS` for headless provisioning: on boot, if the board has no saved Wi-Fi, it writes the credentials and a placeholder hatch token — no Muse app, no BLE pairing, no account.
 
+## Language behavior (v0.2.10)
+
+The default persona puts reply length near the front: one or two short sentences, about **40 words or 60 Chinese characters**. It answers in the user's language and defaults to English when unclear. A greeting-only or wake-only input returns exactly `Please ask.`; a real question that includes a greeting must still be answered. Greetings and wake phrases are forbidden in ordinary replies. These are model instructions rather than hard output truncation.
+
+`BRAIN_STT_LANG=""` and `BRAIN_STT_PROMPT=""` omit the corresponding multipart fields, allowing automatic language detection. To intentionally constrain transcription, set an ISO 639-1 code such as `en` or `ko`. The literal string `auto` is not a special value: it would be sent as a language field. A nonempty prompt can bias recognition and language selection.
+
+Chinese and Korean reply text selects `TTS_MODEL_CJK` when configured; an empty alternate model falls back to `TTS_MODEL`. This routing does not guarantee every language or script is supported. Korean speech/text was tested, but Korean glyph coverage on the physical LCD has not been audited. Chinese captions require the optional CJK font build.
+
+The verified pre-release language samples took **EN 3.9 s / CN 8.7 s / KO (fresh history) 3.2 s**. The final flashed firmware used different questions and produced longer replies: EN 29 words / 7.1 s, CN 72 characters (66 Han) / 15.1 s, KO 76 characters / 10.3 s. The Chinese sample exceeded the approximate 60-character instruction; no truncation or persona workaround was added. These are SDK typed-turn durations including speech fetch/decode, not physical first-sound measurements. Current UX receipts and coverage limits are in [RELEASE-NOTES-BLOCKERS.md](../RELEASE-NOTES-BLOCKERS.md).
+
+The generated persona and nonsecret model/language settings were compared byte-for-byte against the header used for the already verified device build. Existing RAM conversation history is cleared by reboot; no history workaround was added.
+
 ## Turn pipeline
 
 ```
-PTT release → record finalized (min 0.3 s, else "DIDN'T CATCH THAT")
+PTT release → record finalized (at least 400 ms qualified speech, else "DIDN'T CATCH THAT")
   → wav_trim_silence(): the PTT note is mostly air at the edges; trim to speech ±200 ms
   → multipart POST to the transcription endpoint (keep-alive session A)
   → transcript opens an SSE chat stream (session A) and reserves the message slot up front
@@ -145,7 +155,7 @@ PTT release → record finalized (min 0.3 s, else "DIDN'T CATCH THAT")
     → MP3 appended to the turn's audio buffer; responses 2+ have their ID3 tag stripped
     → decode() runs from the HTTP event handler: speaking starts while the LLM writes the next sentence
   → no audio by turn end (e.g. an empty or all-whitespace reply) → captions only
-  → turn ends when all messages are done and settled 3 s (or the cap: 180 s voice / 15 min typed)
+  → turn ends after all messages and queued audio have drained
 ```
 
 Short replies can use one session: after the chat HTTP response is fully consumed, speech reuses its client when HTTPS authority and pinned roots match. Replies up to 128 UTF-8 bytes are batched for one speech request; longer replies use a separate speech client while chat continues streaming. `perform()` and its data callback retain the client state correctly; the manual `open()` path in IDF 6 started a new connection each turn. A stale socket gets one immediate retry before any reply data arrives. TLS 1.3 tickets are saved after reading response headers and scoped to the provider origin; changing hosts discards the old ticket. A HEAD request prepares the connection after Wi-Fi becomes ready (and before recording if no client exists); a 405 response is expected for a POST-only transcription endpoint and still establishes authenticated TLS.
@@ -153,6 +163,8 @@ Short replies can use one session: after the chat HTTP response is fully consume
 ## Interruption and quiet recordings
 
 Cancellation used to change only the generation counter and enqueue a command. The same task was running blocking HTTP requests, so it could not handle the command until the fetch returned. The final implementation uses ESP-IDF's asynchronous HTTPS client, with the HTTP owner checking cancellation between I/O attempts, including TLS setup. Producers signal cancellation through the generation and queued command. The owner closes and frees old HTTP/TLS clients, resets decoder state and drains queued audio before processing the next turn. Successful ordinary turns retain their keepalive clients.
+
+For typed brain requests, the turn is marked active before synchronous chat/TTS I/O begins. This makes a changed generation visible to the HTTP cancellation predicate. A cancelled fetch closes both clients on the owner task and reports `CANCELLED`; a real failure still reports `BRAIN UNREACHABLE`. Final device checks observed 29 ms from PTT down to cancellation, 42 ms for explicit `>chat.cancel`, and a normal subsequent typed request. This console check is not a real-person spoken-reply barge-in check.
 
 The custom SSL transport bounds each socket read/write wait to 50 ms (TCP connection attempts use up to 500 ms) and maps an idle poll to `EAGAIN`, so IDF does not mistake a gap between body chunks for a truncated response. Normal requests keep a 30-second no-progress timeout, extended by successful connection/header/data events so a healthy long response can continue. HEAD preparation and maintenance use a five-second total budget. Cancelled requests skip retries and stop feeding further chat/TTS data.
 
@@ -192,9 +204,9 @@ The provider template forbids greetings and saying the wake phrase. Greeting-onl
 
 A successful STT response with an empty `text` is now an explicit no-speech discard. It returns `DIDN'T CATCH THAT` without chat, TTS or saved-note retries. Transport failures and malformed responses still retain the existing note retry behavior. Host tests cover both awake and sleeping consumers so a discard cannot become a retry loop.
 
-Final-device checks use the UART logger as the sole reader, volume 14 and mic gain 27. Three typed turns returned in 1.7, 1.7 and 2.7 s without a new turn-path TLS handshake. `hi` and `你好` both returned `Please ask.`; the question returned `瑞利散射。`. A silent PTT note was discarded without STT. The following 60-second awake observation had zero accepted wake events, with WakeNet still running and no reboot. The device was left awake at volume 14 with `muse-serial` active.
+Historical v0.2.9 device checks used the UART logger as the sole reader, volume 14 and mic gain 27. Three typed turns returned in 1.7, 1.7 and 2.7 s without a new turn-path TLS handshake. `hi` and `你好` both returned `Please ask.`; the question returned `瑞利散射。`. A silent PTT note was discarded without STT. The following 60-second awake observation had zero accepted wake events, with WakeNet still running and no reboot. The device was left awake at volume 14 with `muse-serial` active.
 
-The single permitted acoustic `k` attempt was **incomplete**: WakeNet candidates were rejected by the original last-256-ms energy check, so it produced no voice turn or spoken reply. No second acoustic attempt was made. The energy check was then changed to search the most recent second for a qualifying 256 ms window, allowing a candidate reported after the phrase's loud portion; +12 dB remains required. Host tests cover this delayed report, +7 dB rejection and energy expiry. A successful acoustic voice turn and the following 60-second reply-echo check remain unverified on this final revision. Three repeated acoustic `k` turns were excluded under the user's one-use noise limit.
+The single permitted acoustic `k` attempt was **incomplete**: WakeNet candidates were rejected by the original last-256-ms energy check, so it produced no voice turn or spoken reply. No second acoustic attempt was made. The energy check was then changed to search the most recent second for a qualifying 256 ms window, allowing a candidate reported after the phrase's loud portion; +12 dB remains required. Host tests cover this delayed report, +7 dB rejection and energy expiry. A successful acoustic voice turn and the following 60-second reply-echo check were unverified at the v0.2.9 release. The later v0.2.10 language build completed both checks; see the current release receipts. Three repeated acoustic `k` turns were excluded under the user's one-use noise limit.
 
 STT investigation from the preceding dogfood work did not establish a repeatable device upload slowdown. In three controlled pairs, direct/post-interruption STT took 1.440/1.396, 1.805/1.352 and 1.299/1.306 s. Encoding took 25–26 ms and the 23 KB multipart body was queued in 212–479 ms. A tighter immediate-retry sample returned empty text after a 277 ms enqueue plus a 2.951 s wait for response headers; the device's saved-note retries kept returning empty text, exposing the saved-note retry bug fixed above. Socket enqueue time does not prove when every byte reached the server. The self-test volume was also found at 14, about 15 dB below earlier volume-100 captures. The separate three-consecutive-turn ≤3.5 s latency target is not claimed as resolved by this release. All temporary STT timing and WAV-export probes were removed.
 
@@ -205,6 +217,8 @@ The brain client sends an authenticated HEAD to its STT endpoint (or chat endpoi
 Probes run on the HTTP owner's task, with the existing CPU maximum-frequency lock held during the request, including a possible 40 MHz resting configuration. A 405 response is expected at the POST-only transcription endpoint. A failed request or closed socket clears preparation and destroys the stale client and transport. Preparation retries automatically after one second, with exponential backoff capped at 60 seconds. HEAD uses a 5-second I/O timeout; subsequent normal requests reset their timeout to 30 seconds. A probe already in progress can briefly delay a newly queued command, although active or already-queued turns prevent a probe from starting.
 
 Both awake idle and resting idle are covered while Wi-Fi is available. The original battery policy turns Wi-Fi off after two minutes of low-power rest, which is shorter than the keepalive interval; connection maintenance does not force the radio back on. It resumes when Wi-Fi returns. Resting queue waits are finite and follow the deadline, with an offline check at most once per minute.
+
+### Historical v0.2.6 connection checks
 
 The connection-cut check used a temporary test build: immediately before the first keepalive, it called `shutdown()` on the existing client socket. This simulates an unusable connection without changing Wi-Fi or provider credentials. It is not a server-process restart. The test code was removed from the final source, patch, and firmware.
 
@@ -248,7 +262,7 @@ I (386411) turn done: 1 message(s) in 2.9s
 
 The extra post-probe question verified HEAD-to-POST reuse after the long idle window. It completed in 2.9 s with zero new HTTPS-connect events; that sample is retained alongside the six scheduled cold/warm measurements rather than omitted from the timing record. No new TLS was logged; this measurement alone does not isolate the source of the extra delay.
 
-Production firmware SHA-256: `1f69d1506113f62f32ac9bf00339a74568f16e5a4a15ef33d9f93a206a08a6e8`. Patch SHA-256: `8edb582ec4fbf29deccfd5845ed8157dff4077b74d7e107443db461ff50b3e8f`.
+Historical v0.2.6 firmware SHA-256: `1f69d1506113f62f32ac9bf00339a74568f16e5a4a15ef33d9f93a206a08a6e8`. Patch SHA-256: `8edb582ec4fbf29deccfd5845ed8157dff4077b74d7e107443db461ff50b3e8f`.
 
 The v0.2.5 peripheral watchdog remains enabled. This connection-maintenance check does not establish that the underlying DMA fault is resolved.
 
@@ -274,7 +288,7 @@ Server-side floors, measured from a laptop (Chinese prompt, streaming): deepseek
 - **1-character replies**: the sentence gate used to require ≥2 buffered chars, so "4" never got speech and fell into the slower end-of-turn path. Gate is ≥1 now, plus a blank guard so `"\n\n"` never becomes a speech round trip.
 - **Typed turns stall on long replies**: the voice path drains the audio buffer in its own loop; the console path didn't, so a long reply filled the stream buffer and the decoder waited forever. Both drain now.
 - **DeepSeek thinks**: its stream starts with `reasoning_content` deltas that the parser must ignore — and, worse, wait for. `BRAIN_CHAT_EXTRA {"reasoning":{"exclude":true}}` turns the thinking phase off server-side.
-- **Silence ≠ silence**: whisper on a quiet room returns `""` or `" ."`, which the brain reports as `BRAIN STT FAILED` — expected, not a bug.
+- **Silence ≠ silence**: STT can hallucinate on noise. The recording guard rejects weak notes before upload; a successful empty transcript is discarded without chat/TTS or retry. Transport/malformed-response errors remain failures, and arbitrary nonempty hallucinations are not perfectly classified.
 - **Placeholder token**: with headless provisioning the gadget's token (`brain-local`) is rejected by the Muse cloud (HTTP 401 in the log). Harmless: the brain never contacts it, and the stock agent is only a fallback you opted out of.
 
 ## Wake word ("Hi ESP")

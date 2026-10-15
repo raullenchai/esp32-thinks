@@ -35,18 +35,18 @@ echo "== patch applied: patches/muse-brain.patch"
 # 3) Provider config. Defaults below; presets override them.
 TTS_URL="https://api.openai.com/v1/audio/speech"
 TTS_MODEL="tts-1";            TTS_VOICE="nova"
-TTS_MODEL_CJK=""              # optional second voice model for Chinese turns
+TTS_MODEL_CJK=""              # optional second voice model for Chinese/Korean text
 TTS_KEY=""
 STT_URL="https://api.openai.com/v1/audio/transcriptions"
 STT_MODEL="whisper-1"
 STT_ADPCM=0                                    # opt in only with a verified WAV decoder
-STT_LANG="zh"                                   # pin Whisper's language ("auto" = let it guess)
-STT_PROMPT="以下是普通话的句子。"                    # prompt nudge in that language
+STT_LANG=""                                      # empty = auto-detect; optionally pin an ISO 639-1 language
+STT_PROMPT=""                                    # optional prompt nudge; empty = none (a prompt biases the language)
 CHAT_URL="https://api.openai.com/v1"
 CHAT_KEY=""
 CHAT_MODEL="gpt-4o-mini"
 CHAT_EXTRA=""                 # JSON merged into the chat body (provider quirks)
-CHAT_SYSTEM="You are a terse question-answering device. NEVER output a greeting, salutation or wake phrase. NEVER say Hi ESP, High ESP or Hey ESP. If the input is only a greeting or wake phrase (hi, hello, hey, 你好, Hi ESP), respond with exactly Please ask. and nothing else. Otherwise answer directly in the user's language in ONE short sentence of at most 15 characters. No introduction. No greeting. No wake phrase. You cannot take actions or set reminders."
+CHAT_SYSTEM="You are a voice assistant on a small speaker. Answers must be one or two short sentences, at most about 40 words or 60 Chinese characters. Reply in the same language the user spoke; if the language is unclear, reply in English. Never greet, never output a wake phrase, and never say Hi ESP, High ESP or Hey ESP. If the input contains a question, always answer it; respond with exactly: Please ask. only when the input is nothing but a greeting or wake phrase. You cannot take actions, set reminders, or control other devices."
 TTS_CA="OPENAI_CA"; BRAIN_CA="OPENAI_CA"
 
 case "$PRESET" in
@@ -60,7 +60,7 @@ case "$PRESET" in
     echo "== preset: QuickSilver (qwen flash chat, whisper STT, chatterbox/qwen3 TTS)"
     TTS_URL="https://api.quicksilverpro.io/v1/audio/speech"
     TTS_MODEL="chatterbox-turbo"; TTS_VOICE=""
-    TTS_MODEL_CJK="qwen3-tts"     # Chinese turns; chatterbox is English-first
+    TTS_MODEL_CJK="qwen3-tts"     # Chinese/Korean text; chatterbox is English-first
     STT_URL="https://api.quicksilverpro.io/v1/audio/transcriptions"
     STT_MODEL="whisper-large-v3-turbo"
     STT_ADPCM=1                                # IMA ADPCM WAV: ~4x less upload data
@@ -145,8 +145,8 @@ cat > esp32/components/muse/provider_config.h <<EOF
 #define BRAIN_STT_MODEL "$STT_MODEL"
 /* 1: 4-bit IMA ADPCM WAV; 0: 16-bit PCM WAV for maximum compatibility. */
 #define BRAIN_STT_WAV_ADPCM $STT_ADPCM
-/* Whisper hallucinates a language on short notes; pin it (ISO 639-1) and
- * nudge it with a prompt in that language. "auto" sends neither field. */
+/* Empty language/prompt values omit those multipart fields for automatic
+ * language detection. Set an ISO 639-1 language only to intentionally pin it. */
 #define BRAIN_STT_LANG   "$STT_LANG"
 #define BRAIN_STT_PROMPT "$STT_PROMPT"
 

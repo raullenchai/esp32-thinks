@@ -7,6 +7,10 @@ HANDOVER-*.md
 
 # build artifacts
 build*/
+nvsfactory-backup-*.bin
+*.bin
+*.elf
+*.map
 dependencies.lock
 managed_components/
 

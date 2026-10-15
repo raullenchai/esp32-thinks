@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.10 — 2026-10-14 — follow the user's language with natural-length replies
+
+The default persona answers in the user's language, falls back to English when unclear, and requests one or two short sentences (~40 words / 60 Chinese characters). It replaces the former 15-character limit. Greeting-only input still returns `Please ask.`; questions containing a greeting must be answered.
+
+- **Automatic transcription language** — default `BRAIN_STT_LANG` and `BRAIN_STT_PROMPT` to empty and omit those multipart fields. Explicit nonempty values remain configurable.
+- **Korean speech routing** — extend the existing CJK UTF-8 lead-byte heuristic through ED so Hangul reply text selects `TTS_MODEL_CJK`, alongside Chinese.
+- **Verified language samples** — pre-release checks: EN 3.9 s / CN 8.7 s / KO (fresh history) 3.2 s. The final flashed firmware produced EN 29 words / 7.1 s, CN 72 characters (66 Han) / 15.1 s, KO 76 characters / 10.3 s. The Chinese sample exceeded the approximate prompt limit, which is not hard truncation. These typed durations include TTS fetch/decode, not physical playback.
+- **Typed cancellation** — mark the synchronous HTTP request active before I/O, clean both clients after cancellation and report `CANCELLED`. Device checks: PTT cancelled an active typed request in 29 ms; explicit console cancellation took 42 ms.
+- **Validation** — Watcher and AIPI builds pass. Host suite: 271 tests, no failures, two environment skips. A clean SDK clone at `812c46f` accepts the binary patch through `apply.sh`; all patched files match the working SDK, and the generated persona/model/language settings match the device build's header exactly. One acoustic wake/STT/spoken-reply turn passed, followed by 60 s with zero additional wakes and an active detector.
+- **Release preparation** — update README/reference configuration, timing and typed-audio descriptions; add contribution instructions, upstream license attribution and [UX receipts / known limits](RELEASE-NOTES-BLOCKERS.md). The real-human PTT/playback-barge-in coverage gap remains documented. Keep all prior echo, keepalive, cancellation and stall-recovery behavior.
+
 ## v0.2.9 — 2026-10-14 — prevent reply echoes from waking another turn
 
 Wake detection is gated during speaker playback and its 1.5 s tail. Its two-second turn cooldown is now measured after the reply path returns. The previous cooldown ran before reply playback and could expire too early. Manual PTT remains available through both gates.

@@ -33,4 +33,4 @@ if [ -f srmodels/srmodels.bin ] && ! grep -q srmodels flash_args 2>/dev/null; th
     python3 ../tools/muse/paced_esptool.py --chip esp32s3 -p "$PORT" -b 115200 \
         --before default-reset --after hard-reset write-flash 0x822000 srmodels/srmodels.bin
 fi
-echo "flashed. unplug, re-plug (you should hear the boot melody), press the knob and talk -- or say \"Hi ESP\"."
+echo "flashed. after Wi-Fi connects, press the knob and talk -- or say \"Hi ESP\"."

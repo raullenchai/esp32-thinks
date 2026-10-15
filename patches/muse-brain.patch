@@ -399,7 +399,7 @@ index 170e040..4db7d2e 100644
  
  /* Non-blocking; copies the event's text. Events of cancelled turns are dropped. */
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index a6ad810..42adda1 100644
+index a6ad810..0b39187 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
 @@ -42,6 +42,7 @@
@@ -619,7 +619,7 @@ index a6ad810..42adda1 100644
          }
          muse_hatch_console("message_done", nullptr, "\"msg\":%d,\"bytes\":%u", i, (unsigned)n);
          ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)n);
-@@ -1499,6 +1602,959 @@ static void on_chat_ack(stream_t *s)
+@@ -1499,6 +1602,972 @@ static void on_chat_ack(stream_t *s)
      emit(MUSE_HATCH_EV_SENT, nullptr);
  }
  
@@ -629,14 +629,14 @@ index a6ad810..42adda1 100644
 +
 +static void decode(void);
 +
-+/* Chinese replies get their own TTS model when configured: chatterbox is the
-+ * fastest but English-first, qwen3 handles Chinese properly. */
++/* Chinese and Korean replies get their own TTS model when configured:
++ * chatterbox is the fastest but English-first, qwen3 is multilingual. */
 +static const char *tts_model_for(const char *text)
 +{
 +#ifdef TTS_MODEL_CJK
 +    if (TTS_MODEL_CJK[0] && text) {
 +        for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
-+            if (*p >= 0xE4 && *p <= 0xE9) {   /* CJK unified ideographs */
++            if (*p >= 0xE4 && *p <= 0xED) {   /* CJK ideographs E4-E9 and Hangul EA-ED */
 +                return TTS_MODEL_CJK;
 +            }
 +        }
@@ -1219,13 +1219,20 @@ index a6ad810..42adda1 100644
 +static bool brain_stt(const uint8_t *wav, size_t len, char *out, size_t outlen)
 +{
 +    char head[640];
-+    snprintf(head, sizeof(head),
++    size_t hl = (size_t)snprintf(head, sizeof(head),
 +             "--" BRAIN_BOUNDARY "\r\n"
-+             "Content-Disposition: form-data; name=\"model\"\r\n\r\n" BRAIN_STT_MODEL "\r\n"
++             "Content-Disposition: form-data; name=\"model\"\r\n\r\n" BRAIN_STT_MODEL "\r\n");
++    if (BRAIN_STT_LANG[0]) {
++        hl += (size_t)snprintf(head + hl, sizeof(head) - hl,
 +             "--" BRAIN_BOUNDARY "\r\n"
-+             "Content-Disposition: form-data; name=\"language\"\r\n\r\n" BRAIN_STT_LANG "\r\n"
++             "Content-Disposition: form-data; name=\"language\"\r\n\r\n" BRAIN_STT_LANG "\r\n");
++    }
++    if (BRAIN_STT_PROMPT[0]) {
++        hl += (size_t)snprintf(head + hl, sizeof(head) - hl,
 +             "--" BRAIN_BOUNDARY "\r\n"
-+             "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n" BRAIN_STT_PROMPT "\r\n"
++             "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n" BRAIN_STT_PROMPT "\r\n");
++    }
++    snprintf(head + hl, sizeof(head) - hl,
 +             "--" BRAIN_BOUNDARY "\r\n"
 +             "Content-Disposition: form-data; name=\"file\"; filename=\"note.wav\"\r\n"
 +             "Content-Type: audio/wav\r\n\r\n");
@@ -1522,7 +1529,9 @@ index a6ad810..42adda1 100644
 +    s_turn.silent = false;
 +    char reply[2048];
 +    if (!brain_chat_stream(prompt, reply, sizeof(reply))) {
-+        turn_fail("BRAIN UNREACHABLE");
++        bool cancelled = brain_http_cancelled();
++        if (cancelled) brain_cancel_http();
++        turn_fail(cancelled ? "CANCELLED" : "BRAIN UNREACHABLE");
 +        return;
 +    }
 +    if (store) {
@@ -1548,7 +1557,8 @@ index a6ad810..42adda1 100644
 +        muse_hatch_console("final", reply, "\"msg\":0");
 +        muse_hatch_console("message_done", nullptr, "\"msg\":0,\"bytes\":%u", (unsigned)m.len);
 +    }
-+    ESP_LOGI(TAG, "brain reply: %u chars, %u audio bytes", (unsigned)m.len, (unsigned)s_turn.mp3_len);
++    ESP_LOGI(TAG, "brain reply: %u chars, %u audio bytes: %s", (unsigned)m.len,
++             (unsigned)s_turn.mp3_len, m.tail);
 +    s_turn.phase = P_WAIT_REPLY;
 +}
 +
@@ -1571,6 +1581,9 @@ index a6ad810..42adda1 100644
 +
 +static void brain_text_turn(const char *text)
 +{
++    /* HTTP runs inside the command handler. Mark it active before I/O so
++     * producer cancellation is visible while the owner is busy fetching. */
++    s_turn.phase = P_WAIT_REPLY;
 +    s_turn.chat_posted = true;
 +    s_turn.chat_us = s_turn.last_event_us = now_us();
 +    brain_respond(text, true, s_turn.text);
@@ -1579,7 +1592,7 @@ index a6ad810..42adda1 100644
  /* ---- Turn: speech ---- */
  
  static void start_tts(void)
-@@ -1526,6 +2582,34 @@ static void start_tts(void)
+@@ -1526,6 +2595,34 @@ static void start_tts(void)
           * end. decode() plays it at the speaker's volume, captions following,
           * and finishes the message once it's drained.
           */
@@ -1614,7 +1627,7 @@ index a6ad810..42adda1 100644
          m.pcm_start = s_turn.pcm_out;
          m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
          m.tts = TTS_ACTIVE;
-@@ -1540,6 +2624,7 @@ static void start_tts(void)
+@@ -1540,6 +2637,7 @@ static void start_tts(void)
  static void tts_data(const uint8_t *data, size_t len)
  {
      if (s_turn.mp3_len + len > MP3_BUF) {
@@ -1622,7 +1635,7 @@ index a6ad810..42adda1 100644
          ESP_LOGW(TAG, "MP3 buffer full, dropping %u bytes", (unsigned)len);
          len = MP3_BUF - s_turn.mp3_len;
      }
-@@ -1618,7 +2703,8 @@ static void decode(void)
+@@ -1618,7 +2716,8 @@ static void decode(void)
              }
          }
          if (s_turn.down_rate != info.hz) {
@@ -1632,7 +1645,7 @@ index a6ad810..42adda1 100644
              s_turn.down_rate = info.hz;
              resampler_init(&s_turn.down, info.hz, MIC_RATE);
          }
-@@ -1681,7 +2767,9 @@ static void check_turn(void)
+@@ -1681,7 +2780,9 @@ static void check_turn(void)
              return;
          }
      }
@@ -1643,7 +1656,7 @@ index a6ad810..42adda1 100644
          return;
      }
      if (s_turn.agent_busy && t - s_turn.last_content_us < (text ? TEXT_BUSY_HOLD_US : BUSY_HOLD_US)) {
-@@ -1880,7 +2968,7 @@ static void drop_connection(const char *why)
+@@ -1880,7 +2981,7 @@ static void drop_connection(const char *why)
      bool in_turn = s_turn.phase != P_IDLE;
      disconnect(why);
      s_auto_next_us = now_us() + s_auto_backoff_us;
@@ -1652,7 +1665,7 @@ index a6ad810..42adda1 100644
          turn_fail("LOST CONNECTION TO MUSE");
      }
      muse_hatch_report(MUSE_HATCH_UNTESTED, "");
-@@ -1915,7 +3003,8 @@ static void handle(const cmd_t &cmd)
+@@ -1915,7 +3016,8 @@ static void handle(const cmd_t &cmd)
          }
          break;
      case CMD_CANCEL:
@@ -1662,7 +1675,7 @@ index a6ad810..42adda1 100644
              ESP_LOGI(TAG, "turn cancelled");
              turn_finish();
          }
-@@ -1930,6 +3019,7 @@ static void handle(const cmd_t &cmd)
+@@ -1930,6 +3032,7 @@ static void handle(const cmd_t &cmd)
          break;
      case CMD_TEXT_CANCEL:
          if (s_turn.text && s_turn.phase != P_IDLE) {
@@ -1670,7 +1683,7 @@ index a6ad810..42adda1 100644
              turn_fail("CANCELLED");
          }
          break;
-@@ -1941,12 +3031,16 @@ static void handle(const cmd_t &cmd)
+@@ -1941,12 +3044,16 @@ static void handle(const cmd_t &cmd)
  static void hatch_task(void *arg)
  {
      (void)arg;
@@ -1687,7 +1700,7 @@ index a6ad810..42adda1 100644
          TickType_t wait = wait_ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
          if (xQueueReceive(s_cmds, &cmd, wait) == pdTRUE) {
              handle(cmd);
-@@ -1954,11 +3048,16 @@ static void hatch_task(void *arg)
+@@ -1954,11 +3061,16 @@ static void hatch_task(void *arg)
                  handle(cmd);
              }
          }
@@ -1706,7 +1719,7 @@ index a6ad810..42adda1 100644
                  if (ensure_connected()) {
                      s_auto_next_us = INT64_MAX;   /* until it drops */
                      s_auto_backoff_us = AUTO_RETRY_MIN_US;
-@@ -1972,16 +3071,16 @@ static void hatch_task(void *arg)
+@@ -1972,16 +3084,16 @@ static void hatch_task(void *arg)
          }
  
          /* Resting, Wi-Fi may nap; don't wait for the server to go quiet. */
@@ -1726,7 +1739,7 @@ index a6ad810..42adda1 100644
              sent = VOICE_NOTE ? record_note() : pump_mic();
          }
          if (!sent) {
-@@ -1990,24 +3089,33 @@ static void hatch_task(void *arg)
+@@ -1990,24 +3102,33 @@ static void hatch_task(void *arg)
          }
          if (s_turn.phase == P_WAIT_REPLY) {
              start_tts();
@@ -1772,7 +1785,7 @@ index a6ad810..42adda1 100644
              }
          }
      }
-@@ -2037,6 +3145,9 @@ extern "C" void muse_hatch_start(void)
+@@ -2037,6 +3158,9 @@ extern "C" void muse_hatch_start(void)
      }
      cJSON_Hooks hooks = { json_alloc, heap_caps_free };
      cJSON_InitHooks(&hooks);
@@ -1782,7 +1795,7 @@ index a6ad810..42adda1 100644
      /* Keep the command/event queues out of internal DRAM, which Wi-Fi, BLE and
       * mbedTLS can exhaust: when the allocation failed here hatch_task never
       * started and every turn was silently dropped. Fall back to internal RAM
-@@ -2054,6 +3165,14 @@ extern "C" void muse_hatch_start(void)
+@@ -2054,6 +3178,14 @@ extern "C" void muse_hatch_start(void)
      s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
      s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
      s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;
@@ -1797,7 +1810,7 @@ index a6ad810..42adda1 100644
      s_turn.texts = static_cast<char *>(psram_alloc(MAX_MSGS * TEXT_MAX));   /* captions just stay untimed without it */
      s_pcm = static_cast<int16_t *>(psram_alloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)));
      s_pcm16 = static_cast<int16_t *>(psram_alloc((MINIMP3_MAX_SAMPLES_PER_FRAME + 8) * sizeof(int16_t)));
-@@ -2064,6 +3183,7 @@ extern "C" void muse_hatch_start(void)
+@@ -2064,6 +3196,7 @@ extern "C" void muse_hatch_start(void)
      s_turn.tts_msg = -1;
      /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here. */
      if (!s_cmds || !s_events || !s_in || !s_out || !s_turn.chunk || !s_turn.mp3 || (VOICE_NOTE && !s_turn.note) || !s_pcm || !s_pcm16 ||
@@ -1805,7 +1818,7 @@ index a6ad810..42adda1 100644
          xTaskCreatePinnedToCoreWithCaps(hatch_task, "muse_chat", 48 * 1024, nullptr, 5, nullptr, 0,
                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
          ESP_LOGE(TAG, "start failed");
-@@ -2141,7 +3261,8 @@ extern "C" void muse_hatch_text_turn(char *text)
+@@ -2141,7 +3274,8 @@ extern "C" void muse_hatch_text_turn(char *text)
  
  extern "C" void muse_hatch_text_cancel(void)
  {
@@ -4114,10 +4127,10 @@ index 0000000..d99fbde
 +        self.assertLess(error,500)
 diff --git a/esp32/tests/test_muse_brain_empty.py b/esp32/tests/test_muse_brain_empty.py
 new file mode 100644
-index 0000000..9db6945
+index 0000000..d66bc0b
 --- /dev/null
 +++ b/esp32/tests/test_muse_brain_empty.py
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,119 @@
 +import os, shlex, subprocess, tempfile, unittest
 +from pathlib import Path
 +ROOT=Path(__file__).resolve().parents[1]
@@ -4176,7 +4189,12 @@ index 0000000..9db6945
 +static size_t strlcpy(char *out,const char *in,size_t n){size_t len=strlen(in);if(n){size_t take=len<n-1?len:n-1;memcpy(out,in,take);out[take]=0;}return len;}
 +static size_t wav_trim_silence(uint8_t *,size_t n){return n;}
 +static bool brain_http_cancelled(){return false;}
-+static bool openai_perform(const char*,const char*,const char*,const char*,size_t,int){requests++;s_http_sink_len=2;strcpy(sink,"{}");return transport_ok;}
++static bool openai_perform(const char*,const char*,const char*,const char *body,size_t len,int){
++ std::string multipart(body,len);
++ assert((multipart.find("name=\"language\"")!=std::string::npos)==(BRAIN_STT_LANG[0]!=0));
++ assert((multipart.find("name=\"prompt\"")!=std::string::npos)==(BRAIN_STT_PROMPT[0]!=0));
++ requests++;s_http_sink_len=2;strcpy(sink,"{}");return transport_ok;
++}
 +struct cJSON{};
 +static cJSON root,item;
 +static cJSON *cJSON_Parse(const char*){return malformed?nullptr:&root;}
@@ -4220,12 +4238,18 @@ index 0000000..9db6945
 +  p=out/'empty.cpp';p.write_text(code)
 +  r=subprocess.run([*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-Wall','-Wextra','-Werror',str(p),'-o',str(cls.exe)],capture_output=True,text=True)
 +  if r.returncode:raise AssertionError(r.stdout+r.stderr)
++  cls.auto_exe=out/'auto'
++  p.write_text(code.replace('#define BRAIN_STT_LANG "zh"','#define BRAIN_STT_LANG ""').replace('#define BRAIN_STT_PROMPT "test"','#define BRAIN_STT_PROMPT ""'))
++  r=subprocess.run([*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-Wall','-Wextra','-Werror',str(p),'-o',str(cls.auto_exe)],capture_output=True,text=True)
++  if r.returncode:raise AssertionError(r.stdout+r.stderr)
 + def check(self,mode):subprocess.run([str(self.exe),mode],check=True,capture_output=True)
 + def test_empty_note_is_discarded_without_chat_or_retry_awake(self):self.check('awake')
 + def test_empty_saved_note_is_discarded_without_retry_asleep(self):self.check('asleep')
 + def test_valid_speech_still_reaches_chat(self):self.check('speech')
 + def test_transport_failure_retains_retry_behavior(self):self.check('transport')
 + def test_malformed_response_retains_retry_behavior(self):self.check('malformed')
++
++ def test_auto_language_omits_language_and_prompt_fields(self):subprocess.run([str(self.auto_exe),"speech"],check=True,capture_output=True)
 diff --git a/esp32/tests/test_muse_brain_http.py b/esp32/tests/test_muse_brain_http.py
 new file mode 100644
 index 0000000..06574dc
@@ -4949,6 +4973,118 @@ index 0000000..74a1633
 +            restart, dumps = run(0)
 +            self.assertEqual(restart, 363000)
 +            self.assertEqual(dumps, 2)
+diff --git a/esp32/tests/test_muse_language.py b/esp32/tests/test_muse_language.py
+new file mode 100644
+index 0000000..89580bc
+--- /dev/null
++++ b/esp32/tests/test_muse_language.py
+@@ -0,0 +1,106 @@
++"""Exercise the production TTS language selector, without a network or keys."""
++import os, shlex, subprocess, tempfile, unittest
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++class LanguageRouting(unittest.TestCase):
++ def test_english_chinese_korean_and_default_fallback(self):
++  src=(ROOT/'components/muse/muse_chat_session.cpp').read_text()
++  selector=src[src.index('static const char *tts_model_for('):src.index('/* Persistent HTTPS clients:')]
++  with tempfile.TemporaryDirectory() as tmp:
++   p=Path(tmp)/'route.cpp';exe=Path(tmp)/'route'
++   p.write_text(r'''
++#include <cassert>
++#include <cstring>
++#define TTS_MODEL "default-voice"
++static const char *cjk="multilingual-voice";
++#define TTS_MODEL_CJK cjk
++'''+selector+r'''
++int main() {
++ assert(!strcmp(tts_model_for("Hello world."),TTS_MODEL));
++ assert(!strcmp(tts_model_for("天空为什么蓝？"),cjk));
++ assert(!strcmp(tts_model_for("하늘은 왜 파란가요?"),cjk));
++ assert(!strcmp(tts_model_for("English then 한글"),cjk));
++ assert(!strcmp(tts_model_for(nullptr),TTS_MODEL));
++ assert(!strcmp(tts_model_for(""),TTS_MODEL));
++ cjk="";
++ assert(!strcmp(tts_model_for("中文和한국어"),TTS_MODEL));
++}
++''')
++   r=subprocess.run([*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-Wall','-Wextra','-Werror',str(p),'-o',str(exe)],capture_output=True,text=True)
++   self.assertEqual(r.returncode,0,r.stdout+r.stderr)
++   subprocess.run([str(exe)],check=True,capture_output=True)
++
++ def test_typed_http_observes_cancel_before_the_reply_is_complete(self):
++  src=(ROOT/'components/muse/muse_chat_session.cpp').read_text()
++  active=src[src.index('static bool brain_http_cancelled(void)'):src.index('static esp_err_t brain_http_perform(')]
++  text=src[src.index('static void brain_text_turn(const char *text)\n{'):src.index('/* ---- Turn: speech ---- */')]
++  with tempfile.TemporaryDirectory() as tmp:
++   p=Path(tmp)/'cancel.cpp';exe=Path(tmp)/'cancel'
++   p.write_text(r'''
++#include <cassert>
++#include <atomic>
++#include <cstdint>
++enum {P_IDLE,P_WAIT_REPLY};
++struct {int phase=P_IDLE;uint32_t gen=7;bool chat_posted=false;int64_t chat_us=0,last_event_us=0;bool text=true;} s_turn;
++static std::atomic<uint32_t> s_gen{7};
++static int64_t now_us(){return 123;}
++'''+active+r'''
++static void brain_respond(const char*,bool,bool) {
++ // Simulate cancellation arriving while chat/TTS has not returned yet.
++ assert(!brain_http_cancelled());
++ ++s_gen;
++ assert(brain_http_cancelled());
++}
++'''+text+r'''
++int main(){brain_text_turn("question");assert(s_turn.chat_posted);}
++''')
++   r=subprocess.run([*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-Wall','-Wextra','-Werror',str(p),'-o',str(exe)],capture_output=True,text=True)
++   self.assertEqual(r.returncode,0,r.stdout+r.stderr)
++   subprocess.run([str(exe)],check=True,capture_output=True)
++
++ def test_cancelled_reply_cleans_clients_and_reports_cancellation(self):
++  src=(ROOT/'components/muse/muse_chat_session.cpp').read_text()
++  respond=src[src.index('static void brain_respond(const char *prompt, bool store, bool console)\n{'):src.index('static void brain_voice_reply(void)\n{')]
++  with tempfile.TemporaryDirectory() as tmp:
++   p=Path(tmp)/'reason.cpp';exe=Path(tmp)/'reason'
++   p.write_text(r'''
++#include <cassert>
++#include <cstring>
++#include <cstdio>
++#include <cstddef>
++#define strlcpy host_strlcpy
++#define MAX_MSGS 2
++#define TEXT_MAX 512
++#define TTS_ACTIVE 1
++#define TTS_QUEUED 2
++#define P_WAIT_REPLY 3
++struct msg_t {char id[16];unsigned pcm_start,pcm_frames;int tts;bool done;unsigned len;char tail[512];};
++static struct {unsigned nmsgs=0,mp3_len=0,pcm_out=0;bool mp3_ended=false,silent=false;int kbps=0,down_rate=0,tts_msg=0,phase=0,dec=0;msg_t msgs[MAX_MSGS];} s_turn;
++static bool cancelled=false,s_brain_sent=false;
++static int cleanups=0;
++static char reason[64];
++static const char *TAG="test";
++static void log_noop(const char*,const char*,...){}
++#define ESP_LOGI log_noop
++static size_t strlcpy(char*out,const char*in,size_t n){return (size_t)snprintf(out,n,"%s",in);}
++static void mp3dec_init(int*){}
++static bool brain_http_cancelled(){return cancelled;}
++static bool brain_chat_stream(const char*,char*,size_t){return false;}
++static void brain_cancel_http(){cleanups++;}
++static void turn_fail(const char *s){strlcpy(reason,s,sizeof(reason));}
++static void brain_hist_add(const char*,const char*){}
++static void append_text(msg_t&,const char*){}
++static void show_reply_start(msg_t&){}
++static void muse_hatch_console(const char*,const char*,const char*,...){}
++'''+respond+r'''
++int main(){
++ brain_respond("question",true,true);
++ assert(!strcmp(reason,"BRAIN UNREACHABLE") && cleanups==0);
++ cancelled=true;
++ brain_respond("question",true,true);
++ assert(!strcmp(reason,"CANCELLED") && cleanups==1);
++}
++''')
++   r=subprocess.run([*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-Wall','-Wextra','-Werror',str(p),'-o',str(exe)],capture_output=True,text=True)
++   self.assertEqual(r.returncode,0,r.stdout+r.stderr)
++   subprocess.run([str(exe)],check=True,capture_output=True)
 diff --git a/esp32/tests/test_muse_speech_guard.py b/esp32/tests/test_muse_speech_guard.py
 new file mode 100644
 index 0000000..eed7d59
