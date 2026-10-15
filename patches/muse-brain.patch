@@ -136,10 +136,14 @@ index d5cfdec..5a25ddc 100644
    lvgl/lvgl:
      version: "9.5.0"
 diff --git a/esp32/components/muse/muse_audio.c b/esp32/components/muse/muse_audio.c
-index 9602928..ded021c 100644
+index 9602928..ed3151e 100644
 --- a/esp32/components/muse/muse_audio.c
 +++ b/esp32/components/muse/muse_audio.c
-@@ -28,6 +28,7 @@
+@@ -25,9 +25,11 @@
+ #include "esp_heap_caps.h"
+ #include "esp_log.h"
+ #include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
  
  #include "muse_board.h"
  #include "muse_mem.h"
@@ -147,7 +151,22 @@ index 9602928..ded021c 100644
  #include "muse_settings.h"
  
  static const char *TAG = "muse_audio";
-@@ -41,6 +42,23 @@ static bool s_open;
+@@ -38,9 +40,45 @@ static const char *TAG = "muse_audio";
+ static esp_codec_dev_handle_t s_spk;
+ static esp_codec_dev_handle_t s_mic;
+ static bool s_open;
++static portMUX_TYPE s_playback_mux = portMUX_INITIALIZER_UNLOCKED;
++static bool s_playback_active;
++static int64_t s_playback_last_us;
++
++bool muse_audio_playback_recent(int64_t now_us)
++{
++    portENTER_CRITICAL(&s_playback_mux);
++    bool recent = s_playback_active ||
++                  (s_playback_last_us && now_us - s_playback_last_us < 1500000);
++    portEXIT_CRITICAL(&s_playback_mux);
++    return recent;
++}
  static int16_t s_in_stereo[MUSE_AUDIO_CHUNK * CHANNELS];
  static int16_t s_out_stereo[MUSE_AUDIO_CHUNK * CHANNELS];
  
@@ -162,8 +181,15 @@ index 9602928..ded021c 100644
 +
 +static int codec_write(void *data, int bytes)
 +{
++    portENTER_CRITICAL(&s_playback_mux);
++    s_playback_active = true;
++    portEXIT_CRITICAL(&s_playback_mux);
 +    muse_io_watch_begin(MUSE_IO_TX);
 +    int ret = esp_codec_dev_write(s_spk, data, bytes);
++    portENTER_CRITICAL(&s_playback_mux);
++    s_playback_last_us = esp_timer_get_time();
++    s_playback_active = false;
++    portEXIT_CRITICAL(&s_playback_mux);
 +    muse_io_watch_end(MUSE_IO_TX, ret == ESP_CODEC_DEV_OK);
 +    return ret;
 +}
@@ -171,7 +197,7 @@ index 9602928..ded021c 100644
  /* One-pole high-pass on the mixed mic signal. */
  static float s_hpf_a;
  static float s_hpf_x1, s_hpf_y1;
-@@ -84,6 +102,7 @@ void muse_audio_power(bool on)
+@@ -84,6 +122,7 @@ void muse_audio_power(bool on)
      if (!s_spk || on == s_open) {
          return;
      }
@@ -179,7 +205,7 @@ index 9602928..ded021c 100644
      /* The shared I2S bus gets disabled twice (once per codec), which logs a
       * harmless error. */
      esp_log_level_t lvl = esp_log_level_get("i2s_common");
-@@ -105,8 +124,12 @@ void muse_audio_power(bool on)
+@@ -105,8 +144,12 @@ void muse_audio_power(bool on)
          esp_codec_dev_close(s_spk);
          esp_codec_dev_close(s_mic);
          s_open = false;
@@ -192,7 +218,7 @@ index 9602928..ded021c 100644
  }
  
  void muse_audio_set_volume(int volume)
-@@ -139,13 +162,13 @@ void muse_audio_selftest(void)
+@@ -139,13 +182,13 @@ void muse_audio_selftest(void)
  
      /* Capture: drop the DMA backlog, then time a known number of frames. */
      for (int n = 0; n < FLUSH; n += MUSE_AUDIO_CHUNK) {
@@ -208,7 +234,7 @@ index 9602928..ded021c 100644
          for (int i = 0; i < MUSE_AUDIO_CHUNK; i++) {
              int l = s_in_stereo[2 * i], r = s_in_stereo[2 * i + 1];
              ml += l;
-@@ -166,11 +189,11 @@ void muse_audio_selftest(void)
+@@ -166,11 +209,11 @@ void muse_audio_selftest(void)
      /* Playback: fill the DMA queue with silence, then time more silence. */
      memset(s_out_stereo, 0, sizeof(s_out_stereo));
      for (int n = 0; n < FLUSH; n += MUSE_AUDIO_CHUNK) {
@@ -222,7 +248,7 @@ index 9602928..ded021c 100644
      }
      float play_hz = MEASURE * 1e6f / (float)(esp_timer_get_time() - t0);
  
-@@ -228,8 +251,8 @@ void muse_audio_loopback_test(int volume)
+@@ -228,8 +271,8 @@ void muse_audio_loopback_test(int volume)
                      phase += 2.0f * (float)M_PI * f / MUSE_AUDIO_RATE;
                      s_out_stereo[2 * i] = s_out_stereo[2 * i + 1] = v;
                  }
@@ -233,7 +259,7 @@ index 9602928..ded021c 100644
                  /* Skip the first SKIP*2 frames: DMA latency plus the previous tone's tail. */
                  if (n >= 2 * SKIP && got + MUSE_AUDIO_CHUNK <= MEAS) {
                      memcpy(cap + got * CHANNELS, s_in_stereo, sizeof(s_in_stereo));
-@@ -263,7 +286,7 @@ esp_err_t muse_audio_read(int16_t *mono, size_t frames)
+@@ -263,7 +306,7 @@ esp_err_t muse_audio_read(int16_t *mono, size_t frames)
  {
      while (frames) {
          size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
@@ -242,7 +268,7 @@ index 9602928..ded021c 100644
              return ESP_FAIL;
          }
          for (size_t i = 0; i < n; i++) {
-@@ -291,7 +314,7 @@ esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
+@@ -291,7 +334,7 @@ esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
              s_out_stereo[2 * i] = mute ? 0 : mono[i];
              s_out_stereo[2 * i + 1] = mute ? 0 : mono[i];
          }
@@ -251,6 +277,20 @@ index 9602928..ded021c 100644
              return ESP_FAIL;
          }
          mono += n;
+diff --git a/esp32/components/muse/muse_audio.h b/esp32/components/muse/muse_audio.h
+index ed115e8..ba5fdaa 100644
+--- a/esp32/components/muse/muse_audio.h
++++ b/esp32/components/muse/muse_audio.h
+@@ -52,6 +52,9 @@ esp_err_t muse_audio_read(int16_t *mono, size_t frames);
+ /* Blocking write of `frames` mono samples to the speaker. */
+ esp_err_t muse_audio_write(const int16_t *mono, size_t frames);
+ 
++/* Speaker write in progress, or less than 1.5 s since its last completion. */
++bool muse_audio_playback_recent(int64_t now_us);
++
+ /* RMS of a buffer in dBFS (-100 for silence). */
+ float muse_audio_dbfs(const int16_t *mono, size_t frames);
+ 
 diff --git a/esp32/components/muse/muse_brain_audio.c b/esp32/components/muse/muse_brain_audio.c
 new file mode 100644
 index 0000000..9b92d2b
@@ -346,8 +386,20 @@ index 0000000..d3d02a9
 +#ifdef __cplusplus
 +}
 +#endif
+diff --git a/esp32/components/muse/muse_chat.h b/esp32/components/muse/muse_chat.h
+index 170e040..4db7d2e 100644
+--- a/esp32/components/muse/muse_chat.h
++++ b/esp32/components/muse/muse_chat.h
+@@ -94,6 +94,7 @@ typedef enum {
+     MUSE_HATCH_EV_DONE,     /* reply complete; the audio stream is drained after this */
+     MUSE_HATCH_EV_ERROR,    /* turn failed; text says why */
+     MUSE_HATCH_EV_SENT,     /* the VM has acknowledged the note */
++    MUSE_HATCH_EV_DISCARDED, /* no speech: discard this note, do not retry it */
+ } muse_hatch_ev_t;
+ 
+ /* Non-blocking; copies the event's text. Events of cancelled turns are dropped. */
 diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
-index a6ad810..27279d6 100644
+index a6ad810..42adda1 100644
 --- a/esp32/components/muse/muse_chat_session.cpp
 +++ b/esp32/components/muse/muse_chat_session.cpp
 @@ -42,6 +42,7 @@
@@ -567,7 +619,7 @@ index a6ad810..27279d6 100644
          }
          muse_hatch_console("message_done", nullptr, "\"msg\":%d,\"bytes\":%u", i, (unsigned)n);
          ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)n);
-@@ -1499,6 +1602,938 @@ static void on_chat_ack(stream_t *s)
+@@ -1499,6 +1602,959 @@ static void on_chat_ack(stream_t *s)
      emit(MUSE_HATCH_EV_SENT, nullptr);
  }
  
@@ -630,6 +682,7 @@ index a6ad810..27279d6 100644
 +{
 +    return cli == &s_openai_cli ? s_brain_transport : s_speech_transport;
 +}
++
 +
 +#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
 +/* IDF's async HTTP state machine still calls transport select(timeout_ms).
@@ -1124,7 +1177,7 @@ index a6ad810..27279d6 100644
 +
 +/* ---- Brain: bring your own brain (any OpenAI-compatible endpoint) ---- */
 +
-+#define BRAIN_HIST_MSGS 8             /* user/assistant entries kept in RAM */
++#define BRAIN_HIST_MSGS 4             /* user/assistant entries kept in RAM */
 +#define BRAIN_HIST_LEN 512
 +#define BRAIN_BOUNDARY "esp32thinks7d3a"
 +
@@ -1218,7 +1271,7 @@ index a6ad810..27279d6 100644
 +        return false;
 +    }
 +    const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(root, "text"));
-+    bool ok = text && text[0];
++    bool ok = text != nullptr;   /* an empty transcript is a valid no-speech result */
 +    if (ok) {
 +        strlcpy(out, text, outlen);
 +    }
@@ -1415,9 +1468,23 @@ index a6ad810..27279d6 100644
 +    return ok;
 +}
 +
++/* Wake/echo transcripts must not teach the next reply to say the wake phrase. */
++static bool brain_echo_text(const char *text)
++{
++    char letters[1024];
++    size_t n = 0;
++    for (const unsigned char *p = (const unsigned char *)text; *p && n + 1 < sizeof(letters); p++) {
++        unsigned char c = *p;
++        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
++        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) letters[n++] = c;
++    }
++    letters[n] = 0;
++    return strstr(letters, "hiesp") || strstr(letters, "highesp") || strstr(letters, "heyesp");
++}
++
 +static void brain_hist_add(const char *user, const char *assistant)
 +{
-+    if (!s_brain_hist) {
++    if (!s_brain_hist || brain_echo_text(user) || brain_echo_text(assistant)) {
 +        return;
 +    }
 +    if (s_brain_hist_n + 2 > BRAIN_HIST_MSGS) {
@@ -1492,6 +1559,12 @@ index a6ad810..27279d6 100644
 +        turn_fail("BRAIN STT FAILED");
 +        return;
 +    }
++    if (!heard[0]) {
++        ESP_LOGI(TAG, "STT found no speech; discarding note");
++        emit(MUSE_HATCH_EV_DISCARDED, "DIDN'T CATCH THAT");
++        turn_finish();
++        return;
++    }
 +    ESP_LOGI(TAG, "brain heard: %s", heard);
 +    brain_respond(heard, true, false);
 +}
@@ -1506,7 +1579,7 @@ index a6ad810..27279d6 100644
  /* ---- Turn: speech ---- */
  
  static void start_tts(void)
-@@ -1526,6 +2561,34 @@ static void start_tts(void)
+@@ -1526,6 +2582,34 @@ static void start_tts(void)
           * end. decode() plays it at the speaker's volume, captions following,
           * and finishes the message once it's drained.
           */
@@ -1541,7 +1614,7 @@ index a6ad810..27279d6 100644
          m.pcm_start = s_turn.pcm_out;
          m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
          m.tts = TTS_ACTIVE;
-@@ -1540,6 +2603,7 @@ static void start_tts(void)
+@@ -1540,6 +2624,7 @@ static void start_tts(void)
  static void tts_data(const uint8_t *data, size_t len)
  {
      if (s_turn.mp3_len + len > MP3_BUF) {
@@ -1549,7 +1622,7 @@ index a6ad810..27279d6 100644
          ESP_LOGW(TAG, "MP3 buffer full, dropping %u bytes", (unsigned)len);
          len = MP3_BUF - s_turn.mp3_len;
      }
-@@ -1618,7 +2682,8 @@ static void decode(void)
+@@ -1618,7 +2703,8 @@ static void decode(void)
              }
          }
          if (s_turn.down_rate != info.hz) {
@@ -1559,7 +1632,7 @@ index a6ad810..27279d6 100644
              s_turn.down_rate = info.hz;
              resampler_init(&s_turn.down, info.hz, MIC_RATE);
          }
-@@ -1681,7 +2746,9 @@ static void check_turn(void)
+@@ -1681,7 +2767,9 @@ static void check_turn(void)
              return;
          }
      }
@@ -1570,7 +1643,7 @@ index a6ad810..27279d6 100644
          return;
      }
      if (s_turn.agent_busy && t - s_turn.last_content_us < (text ? TEXT_BUSY_HOLD_US : BUSY_HOLD_US)) {
-@@ -1880,7 +2947,7 @@ static void drop_connection(const char *why)
+@@ -1880,7 +2968,7 @@ static void drop_connection(const char *why)
      bool in_turn = s_turn.phase != P_IDLE;
      disconnect(why);
      s_auto_next_us = now_us() + s_auto_backoff_us;
@@ -1579,7 +1652,7 @@ index a6ad810..27279d6 100644
          turn_fail("LOST CONNECTION TO MUSE");
      }
      muse_hatch_report(MUSE_HATCH_UNTESTED, "");
-@@ -1915,7 +2982,8 @@ static void handle(const cmd_t &cmd)
+@@ -1915,7 +3003,8 @@ static void handle(const cmd_t &cmd)
          }
          break;
      case CMD_CANCEL:
@@ -1589,7 +1662,7 @@ index a6ad810..27279d6 100644
              ESP_LOGI(TAG, "turn cancelled");
              turn_finish();
          }
-@@ -1930,6 +2998,7 @@ static void handle(const cmd_t &cmd)
+@@ -1930,6 +3019,7 @@ static void handle(const cmd_t &cmd)
          break;
      case CMD_TEXT_CANCEL:
          if (s_turn.text && s_turn.phase != P_IDLE) {
@@ -1597,7 +1670,7 @@ index a6ad810..27279d6 100644
              turn_fail("CANCELLED");
          }
          break;
-@@ -1941,12 +3010,16 @@ static void handle(const cmd_t &cmd)
+@@ -1941,12 +3031,16 @@ static void handle(const cmd_t &cmd)
  static void hatch_task(void *arg)
  {
      (void)arg;
@@ -1614,7 +1687,7 @@ index a6ad810..27279d6 100644
          TickType_t wait = wait_ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
          if (xQueueReceive(s_cmds, &cmd, wait) == pdTRUE) {
              handle(cmd);
-@@ -1954,11 +3027,16 @@ static void hatch_task(void *arg)
+@@ -1954,11 +3048,16 @@ static void hatch_task(void *arg)
                  handle(cmd);
              }
          }
@@ -1633,7 +1706,7 @@ index a6ad810..27279d6 100644
                  if (ensure_connected()) {
                      s_auto_next_us = INT64_MAX;   /* until it drops */
                      s_auto_backoff_us = AUTO_RETRY_MIN_US;
-@@ -1972,16 +3050,16 @@ static void hatch_task(void *arg)
+@@ -1972,16 +3071,16 @@ static void hatch_task(void *arg)
          }
  
          /* Resting, Wi-Fi may nap; don't wait for the server to go quiet. */
@@ -1653,7 +1726,7 @@ index a6ad810..27279d6 100644
              sent = VOICE_NOTE ? record_note() : pump_mic();
          }
          if (!sent) {
-@@ -1990,24 +3068,33 @@ static void hatch_task(void *arg)
+@@ -1990,24 +3089,33 @@ static void hatch_task(void *arg)
          }
          if (s_turn.phase == P_WAIT_REPLY) {
              start_tts();
@@ -1699,7 +1772,7 @@ index a6ad810..27279d6 100644
              }
          }
      }
-@@ -2037,6 +3124,9 @@ extern "C" void muse_hatch_start(void)
+@@ -2037,6 +3145,9 @@ extern "C" void muse_hatch_start(void)
      }
      cJSON_Hooks hooks = { json_alloc, heap_caps_free };
      cJSON_InitHooks(&hooks);
@@ -1709,7 +1782,7 @@ index a6ad810..27279d6 100644
      /* Keep the command/event queues out of internal DRAM, which Wi-Fi, BLE and
       * mbedTLS can exhaust: when the allocation failed here hatch_task never
       * started and every turn was silently dropped. Fall back to internal RAM
-@@ -2054,6 +3144,14 @@ extern "C" void muse_hatch_start(void)
+@@ -2054,6 +3165,14 @@ extern "C" void muse_hatch_start(void)
      s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
      s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
      s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;
@@ -1724,7 +1797,7 @@ index a6ad810..27279d6 100644
      s_turn.texts = static_cast<char *>(psram_alloc(MAX_MSGS * TEXT_MAX));   /* captions just stay untimed without it */
      s_pcm = static_cast<int16_t *>(psram_alloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)));
      s_pcm16 = static_cast<int16_t *>(psram_alloc((MINIMP3_MAX_SAMPLES_PER_FRAME + 8) * sizeof(int16_t)));
-@@ -2064,6 +3162,7 @@ extern "C" void muse_hatch_start(void)
+@@ -2064,6 +3183,7 @@ extern "C" void muse_hatch_start(void)
      s_turn.tts_msg = -1;
      /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here. */
      if (!s_cmds || !s_events || !s_in || !s_out || !s_turn.chunk || !s_turn.mp3 || (VOICE_NOTE && !s_turn.note) || !s_pcm || !s_pcm16 ||
@@ -1732,7 +1805,7 @@ index a6ad810..27279d6 100644
          xTaskCreatePinnedToCoreWithCaps(hatch_task, "muse_chat", 48 * 1024, nullptr, 5, nullptr, 0,
                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
          ESP_LOGE(TAG, "start failed");
-@@ -2141,7 +3240,8 @@ extern "C" void muse_hatch_text_turn(char *text)
+@@ -2141,7 +3261,8 @@ extern "C" void muse_hatch_text_turn(char *text)
  
  extern "C" void muse_hatch_text_cancel(void)
  {
@@ -1902,10 +1975,10 @@ index b42f8fa..fd4834f 100644
  void muse_wifi_nap(bool nap)
 diff --git a/esp32/components/muse/muse_speech_guard.h b/esp32/components/muse/muse_speech_guard.h
 new file mode 100644
-index 0000000..4fe3c8c
+index 0000000..7dc448e
 --- /dev/null
 +++ b/esp32/components/muse/muse_speech_guard.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,59 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -1928,6 +2001,7 @@ index 0000000..4fe3c8c
 +typedef struct {
 +    float floor_db;
 +    unsigned voiced_run_ms;
++    unsigned voiced_ms;
 +    unsigned quiet_ms;
 +    unsigned elapsed_ms;
 +    bool speech;
@@ -1940,6 +2014,7 @@ index 0000000..4fe3c8c
 +    if (voice && db > g->floor_db + 6.0f) {
 +        g->voiced_run_ms += ms;
 +        if (g->voiced_run_ms >= 80) {
++            g->voiced_ms += g->voiced_run_ms - ms < 80 ? g->voiced_run_ms : ms;
 +            g->speech = true;
 +            g->quiet_ms = 0;
 +        }
@@ -1957,11 +2032,17 @@ index 0000000..4fe3c8c
 +{
 +    return g->elapsed_ms >= 2000 && g->quiet_ms >= 3000;
 +}
++
++/* Count sustained speech above this microphone's local background. */
++static inline bool muse_speech_guard_accept(const muse_speech_guard_t *g)
++{
++    return g->voiced_ms >= 400;
++}
 diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
-index 35a7ff4..c7ff11a 100644
+index 35a7ff4..84d9a2a 100644
 --- a/esp32/components/muse/muse_voice.c
 +++ b/esp32/components/muse/muse_voice.c
-@@ -24,12 +24,27 @@
+@@ -24,12 +24,28 @@
  #include "esp_heap_caps.h"
  #include "esp_log.h"
  #include "esp_timer.h"
@@ -1979,6 +2060,7 @@ index 35a7ff4..c7ff11a 100644
  #include "muse_audio.h"
 +#include "muse_io_watch.h"
 +#include "muse_speech_guard.h"
++#include "muse_wake_guard.h"
 +#if CONFIG_IDF_TARGET_ESP32S3
 +#include "esp_vad.h"
 +#endif
@@ -1989,7 +2071,7 @@ index 35a7ff4..c7ff11a 100644
  #include "muse_board.h"
  #include "muse_chat.h"
  #include "muse_input.h"
-@@ -37,8 +52,24 @@
+@@ -37,8 +53,24 @@
  #include "muse_settings.h"
  #include "muse_state.h"
  #include "muse_wifi.h"
@@ -2014,7 +2096,7 @@ index 35a7ff4..c7ff11a 100644
  
  #define MAX_SECS 15
  #define TAIL_FRAMES (MUSE_AUDIO_RATE * 12 / 100)   /* capture lag + poll interval, stops before the release click */
-@@ -62,7 +93,7 @@ static const char *TAG = "muse_voice";
+@@ -62,7 +94,7 @@ static const char *TAG = "muse_voice";
  #define HELD_TRIES 8                            /* then a saved note is dropped */
  #define HELD_POLL_MS 5000                       /* resting with notes saved: check for Wi-Fi this often */
  #define HELD_KEEP_US (30LL * 60 * 1000000)      /* muse_voice_notes_waiting() */
@@ -2023,7 +2105,7 @@ index 35a7ff4..c7ff11a 100644
  #define RETRY_MAX_US (120LL * 1000000)
  #define STALL_US (30LL * 1000000)               /* Hatch took none of a note this long: give up */
  #define ACK_WAIT_US (30LL * 1000000)            /* asleep, waiting for the VM to have a note */
-@@ -73,6 +104,22 @@ static volatile float s_monitor_db = -100.0f;
+@@ -73,6 +105,22 @@ static volatile float s_monitor_db = -100.0f;
  static volatile bool s_chirp;
  static volatile bool s_loopback;
  static volatile bool s_mp3test;
@@ -2046,7 +2128,7 @@ index 35a7ff4..c7ff11a 100644
  
  /*
   * Pre-roll: while idle the mic keeps running into this ring, so a recording
-@@ -86,6 +133,7 @@ typedef struct {
+@@ -86,6 +134,7 @@ typedef struct {
  #else
      int16_t pcm[MUSE_AUDIO_CHUNK];
  #endif
@@ -2054,7 +2136,7 @@ index 35a7ff4..c7ff11a 100644
  } pre_chunk_t;
  
  static pre_chunk_t *s_pre;   /* PRE_CHUNKS, a ring */
-@@ -146,6 +194,7 @@ static void idle_capture(void)
+@@ -146,6 +195,7 @@ static void idle_capture(void)
          vTaskDelay(pdMS_TO_TICKS(20));
          return;
      }
@@ -2062,7 +2144,7 @@ index 35a7ff4..c7ff11a 100644
      if (s_monitor) {
          float db = muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK);
          s_monitor_db = db > s_monitor_db ? db : s_monitor_db * 0.9f + db * 0.1f;
-@@ -155,6 +204,7 @@ static void idle_capture(void)
+@@ -155,6 +205,7 @@ static void idle_capture(void)
          return;
      }
      pre_chunk_t *c = &s_pre[s_pre_next];
@@ -2070,7 +2152,7 @@ index 35a7ff4..c7ff11a 100644
  #if MUSE_LOW_MEM
      c->start = s_pre_enc;
      muse_adpcm_encode_block(&s_pre_enc, s_chunk, MUSE_AUDIO_CHUNK, c->adpcm);
-@@ -163,6 +213,21 @@ static void idle_capture(void)
+@@ -163,6 +214,21 @@ static void idle_capture(void)
  #endif
      s_pre_next = (s_pre_next + 1) % PRE_CHUNKS;
      s_pre_fill = s_pre_fill < PRE_CHUNKS ? s_pre_fill + 1 : PRE_CHUNKS;
@@ -2092,7 +2174,7 @@ index 35a7ff4..c7ff11a 100644
  }
  
  /* Non-blocking: returns true if an event of `type` arrived (others dropped). */
-@@ -185,6 +250,10 @@ typedef struct {
+@@ -185,6 +251,10 @@ typedef struct {
      float floor_db;
      float tail_db[25];   /* the last 0.5 s, to see where speech ends and the release click lands */
      size_t chunks;
@@ -2103,7 +2185,7 @@ index 35a7ff4..c7ff11a 100644
  } rec_stats_t;
  
  /* Adds one captured chunk (up to MUSE_AUDIO_CHUNK frames) to the stats. */
-@@ -199,6 +268,11 @@ static void keep(rec_stats_t *st, const int16_t *pcm, size_t n)
+@@ -199,6 +269,11 @@ static void keep(rec_stats_t *st, const int16_t *pcm, size_t n)
      st->frames += n;
      if (n == MUSE_AUDIO_CHUNK) {
          float db = muse_audio_dbfs(pcm, n);
@@ -2115,7 +2197,7 @@ index 35a7ff4..c7ff11a 100644
          st->floor_db = db < st->floor_db ? db : st->floor_db;
          st->tail_db[st->chunks++ % 25] = db;
      }
-@@ -252,6 +326,20 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -252,6 +327,20 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
      muse_state_set_progress(0);
      s_rec_n = s_sent = 0;
      s_live = s_tried = false;
@@ -2136,7 +2218,7 @@ index 35a7ff4..c7ff11a 100644
      if (!s_rec || (muse_hatch_ready() && !s_held_count)) {
          go_live();
      }
-@@ -259,10 +347,25 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -259,10 +348,25 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
      bool heard = false, ok = true;
      bool gave_up = false;   /* Hatch failed this note: it's kept, and goes later */
      char text[96];
@@ -2165,7 +2247,7 @@ index 35a7ff4..c7ff11a 100644
          /* Pressed during playback: the queued tail of the reply is still sounding. */
          for (int i = 0; i < SETTLE_CHUNKS; i++) {
              muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK);
-@@ -274,9 +377,9 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -274,9 +378,9 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
              n += MUSE_AUDIO_CHUNK;
          }
      }
@@ -2178,7 +2260,7 @@ index 35a7ff4..c7ff11a 100644
      while (n + MUSE_AUDIO_CHUNK <= stop_at) {
          if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
              break;
-@@ -303,6 +406,12 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -303,6 +407,12 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
              }
          }
          n += MUSE_AUDIO_CHUNK;
@@ -2191,7 +2273,7 @@ index 35a7ff4..c7ff11a 100644
          bool tick = n % (MUSE_AUDIO_CHUNK * 5) == 0;
          if (tick && s_rec && !s_live && !gave_up && !s_held_count && muse_hatch_ready()) {
              ESP_LOGI(TAG, "Muse in reach: streaming the note so far");
-@@ -320,7 +429,26 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -320,7 +430,26 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
              released = true;
              stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
          }
@@ -2218,20 +2300,42 @@ index 35a7ff4..c7ff11a 100644
      muse_state_set_level(0);
      *held = n - pre;
  
-@@ -335,6 +463,12 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+@@ -335,6 +464,12 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
      ESP_LOGI(TAG, "recorded %.2fs%s: rms %.1f dBFS, peak %.1f dBFS, floor %.1f dBFS, %d clipped, gain %d dB",
               (double)n / MUSE_AUDIO_RATE, released ? "" : " (max)", rms_db < -100.0f ? -100.0f : rms_db,
               20.0 * log10((st.peak + 1) / 32768.0), st.floor_db, st.clipped, muse_settings_mic_gain());
-+    if (!st.guard.speech) {
++    if (!muse_speech_guard_accept(&st.guard)) {
 +        strlcpy(why, "DIDN'T CATCH THAT", cap);
-+        ESP_LOGI(TAG, "recording discarded: no speech above adaptive noise floor %.1f dBFS",
-+                 (double)st.guard.floor_db);
++        ESP_LOGI(TAG, "recording discarded: %u ms speech (need 400), adaptive noise floor %.1f dBFS",
++                 st.guard.voiced_ms, (double)st.guard.floor_db);
 +        return false;
 +    }
      return ok;
  }
  
-@@ -401,10 +535,15 @@ static bool hatch_reply(bool *delivered)
+@@ -342,7 +477,8 @@ static void go_idle(const char *caption);
+ 
+ /*
+  * Plays Hatch's reply as it arrives, with its text as the caption. Returns
+- * true if interrupted by a new press. *delivered: the VM has the note.
++ * true if interrupted by a new press. *delivered: the note was handled
++ * (acknowledged or explicitly rejected as no speech), so it must not retry.
+  */
+ static bool hatch_reply(bool *delivered)
+ {
+@@ -382,6 +518,11 @@ static bool hatch_reply(bool *delivered)
+             case MUSE_HATCH_EV_DONE:
+                 done = *delivered = true;
+                 break;
++            case MUSE_HATCH_EV_DISCARDED:
++                *delivered = true;
++                muse_state_set_level(0);
++                go_idle(text);
++                return false;
+             case MUSE_HATCH_EV_ERROR:
+                 ESP_LOGW(TAG, "muse: %s", text);
+                 muse_state_set_level(0);
+@@ -401,10 +542,15 @@ static bool hatch_reply(bool *delivered)
          if (n) {
              if (!speaking) {
                  speaking = true;
@@ -2248,7 +2352,7 @@ index 35a7ff4..c7ff11a 100644
              muse_audio_write(buf, n);
              played += n;
          } else if (done) {
-@@ -420,8 +559,8 @@ static bool hatch_reply(bool *delivered)
+@@ -420,8 +566,8 @@ static bool hatch_reply(bool *delivered)
          }
      }
      muse_state_set_level(0);
@@ -2259,7 +2363,17 @@ index 35a7ff4..c7ff11a 100644
      if (!played) {
          /* No speech (TTS unavailable): leave the reply text up for a moment. */
          vTaskDelay(pdMS_TO_TICKS(2500));
-@@ -786,11 +925,194 @@ static bool can_record(void)
+@@ -611,7 +757,8 @@ static bool wait_delivered(void)
+     while (esp_timer_get_time() < give_up) {
+         muse_hatch_ev_t ev;
+         while ((ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
+-            if (ev == MUSE_HATCH_EV_SENT || ev == MUSE_HATCH_EV_REPLY || ev == MUSE_HATCH_EV_DONE) {
++            if (ev == MUSE_HATCH_EV_SENT || ev == MUSE_HATCH_EV_REPLY || ev == MUSE_HATCH_EV_DONE ||
++                ev == MUSE_HATCH_EV_DISCARDED) {
+                 return true;
+             }
+             if (ev == MUSE_HATCH_EV_ERROR) {
+@@ -786,11 +933,216 @@ static bool can_record(void)
      return true;
  }
  
@@ -2300,12 +2414,28 @@ index 35a7ff4..c7ff11a 100644
 +    ESP_LOGI(TAG, "wake word on: %s, chunk %d frames", name, s_wake_need);
 +}
 +
-+/* Buffers the idle chunks up to the AFE frame size and polls the detector. */
-+static void wake_feed(const int16_t *pcm, int frames)
++static muse_wake_energy_t s_wake_energy;
++static bool s_wake_gate_closed;
++
++static void wake_reset(void)
 +{
-+    if (!s_wn_model || s_wake_turn || esp_timer_get_time() < s_wake_mute_until_us) {
++    s_wake_fill = 0;
++    memset(&s_wake_energy, 0, sizeof(s_wake_energy));
++    if (s_wn && s_wn_model && s_wn->clean) s_wn->clean(s_wn_model);
++}
++
++/* PTT bypasses this detector. Only the deliberate acoustic self-test may
++ * bypass speaker/cooldown gates; it still needs real microphone energy. */
++static void wake_feed(const int16_t *pcm, int frames, bool self_test)
++{
++    if (!s_wn_model || s_wake_turn) return;
++    int64_t now = esp_timer_get_time();
++    if (!muse_wake_allowed(muse_audio_playback_recent(now), now, s_wake_mute_until_us, self_test)) {
++        if (!s_wake_gate_closed) wake_reset();
++        s_wake_gate_closed = true;
 +        return;
 +    }
++    s_wake_gate_closed = false;
 +    while (frames > 0) {
 +        int take = frames < s_wake_need - s_wake_fill ? frames : s_wake_need - s_wake_fill;
 +        memcpy(s_wake_buf + s_wake_fill, pcm, take * sizeof(int16_t));
@@ -2316,11 +2446,17 @@ index 35a7ff4..c7ff11a 100644
 +            return;
 +        }
 +        s_wake_fill = 0;
++        muse_wake_energy_feed(&s_wake_energy, muse_audio_dbfs(s_wake_buf, s_wake_need));
 +        int wn_ret = s_wn->detect(s_wn_model, s_wake_buf);
 +        if (++s_wake_dbg % 64 == 0) {
 +            ESP_LOGI(TAG, "wake: %d detects, last ret %d", s_wake_dbg, wn_ret);
 +        }
 +        if (wn_ret == WAKENET_DETECTED) {
++            if (!muse_wake_energy_accept(&s_wake_energy, s_noise_db)) {
++                ESP_LOGI(TAG, "wake rejected: below adaptive noise floor +12 dB");
++                wake_reset();
++                continue;
++            }
 +            s_wake_turn = true;
 +            s_wake_sil = 0;
 +            s_wake_spoke = false;
@@ -2454,7 +2590,17 @@ index 35a7ff4..c7ff11a 100644
          bool wake = false;
          if (!pending_down) {
              muse_input_event_t ev;
-@@ -828,6 +1150,38 @@ static void voice_task(void *arg)
+@@ -804,6 +1156,9 @@ static void voice_task(void *arg)
+                 set_resting(false);   /* full power while it goes, even asleep */
+                 muse_wifi_power(MUSE_WIFI_FULL);
+                 pending_down = send_held(asleep);
++#if WAKE_WORD
++                s_wake_mute_until_us = esp_timer_get_time() + 2000000;
++#endif
+                 pre_reset();
+                 if (!pending_down && !asleep && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
+                     muse_state_make_happy();
+@@ -828,6 +1183,39 @@ static void voice_task(void *arg)
                  muse_audio_chirp(1);
                  pre_reset();
              }
@@ -2462,6 +2608,7 @@ index 35a7ff4..c7ff11a 100644
 +            if (s_wake_test) {
 +                s_wake_test = false;
 +                ESP_LOGI(TAG, "wake test: playing phrase");
++                wake_reset();
 +                const int16_t *pcm = (const int16_t *)s_wake_test_pcm_start;
 +                size_t n = (s_wake_test_pcm_end - s_wake_test_pcm_start) / 2;
 +                size_t frames = (n + MUSE_AUDIO_CHUNK - 1) / MUSE_AUDIO_CHUNK * MUSE_AUDIO_CHUNK;
@@ -2479,7 +2626,7 @@ index 35a7ff4..c7ff11a 100644
 +                            memcpy(s_wake_test_capture + s_wake_test_frames, s_chunk, sizeof(s_chunk));
 +                            s_wake_test_frames += MUSE_AUDIO_CHUNK;
 +                        }
-+                        wake_feed(s_chunk, MUSE_AUDIO_CHUNK);
++                        wake_feed(s_chunk, MUSE_AUDIO_CHUNK, true);
 +                    }
 +                }
 +                if (!s_wake_turn) {
@@ -2493,34 +2640,19 @@ index 35a7ff4..c7ff11a 100644
              if (s_mp3test) {
                  s_mp3test = false;
                  int16_t *pcm = NULL;
-@@ -845,6 +1199,11 @@ static void voice_task(void *arg)
+@@ -845,6 +1233,11 @@ static void voice_task(void *arg)
              }
              /* The 20 ms read paces this loop. */
              idle_capture();
 +#if WAKE_WORD
 +            if (s_settle <= 0) {
-+                wake_feed(s_chunk, MUSE_AUDIO_CHUNK);
++                wake_feed(s_chunk, MUSE_AUDIO_CHUNK, false);
 +            }
 +#endif
              if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
                  continue;
              }
-@@ -866,6 +1225,14 @@ static void voice_task(void *arg)
-         char why[96];
-         bool ok = record(pending_down, &held, why, sizeof(why));
-         pending_down = false;
-+#if WAKE_WORD
-+        /* record() plays the reply before it returns, so arm the cooldown
-+         * here: a window set before the turn would expire during a long
-+         * reply and let its tail re-wake the device. */
-+        if (ok) {
-+            s_wake_mute_until_us = esp_timer_get_time() + 4000000;
-+        }
-+#endif
-         if (held < MIN_HELD_FRAMES && !wake) {
-             muse_hatch_turn_cancel();
-             drop_rec();
-@@ -874,6 +1241,8 @@ static void voice_task(void *arg)
+@@ -874,11 +1267,17 @@ static void voice_task(void *arg)
              continue;
          }
          if (!ok) {
@@ -2529,7 +2661,16 @@ index 35a7ff4..c7ff11a 100644
              pre_reset();
              go_idle(why);   /* Hatch failed it while recording */
              continue;
-@@ -887,6 +1256,26 @@ static void voice_task(void *arg)
+         }
+         pending_down = finish_note();
++#if WAKE_WORD
++        /* Start after playback returns, including interrupted/error replies. */
++        s_wake_mute_until_us = esp_timer_get_time() + 2000000;
++#endif
+         pre_reset();
+         if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
+             muse_state_make_happy();
+@@ -887,6 +1286,26 @@ static void voice_task(void *arg)
      }
  }
  
@@ -2556,7 +2697,7 @@ index 35a7ff4..c7ff11a 100644
  esp_err_t muse_voice_start(QueueHandle_t queue)
  {
      s_queue = queue;
-@@ -897,10 +1286,37 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
+@@ -897,10 +1316,37 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
          return ESP_FAIL;
      }
      /* Stack in PSRAM if there is any (this task never writes flash) to spare internal RAM for Wi-Fi/BLE. */
@@ -2595,7 +2736,7 @@ index 35a7ff4..c7ff11a 100644
      return ESP_OK;
  }
  
-@@ -933,6 +1349,14 @@ void muse_voice_request_mp3test(void)
+@@ -933,6 +1379,14 @@ void muse_voice_request_mp3test(void)
      muse_state_nudge();
  }
  
@@ -2629,6 +2770,51 @@ index 7a3ae28..af8b12f 100644
 +
 +/* Coroner: dump the backtrace of every task to the console (for >tasks). */
 +void muse_voice_dump_tasks(void);
+diff --git a/esp32/components/muse/muse_wake_guard.h b/esp32/components/muse/muse_wake_guard.h
+new file mode 100644
+index 0000000..7cc5bab
+--- /dev/null
++++ b/esp32/components/muse/muse_wake_guard.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#pragma once
++#include <stdbool.h>
++#include <stdint.h>
++#include <math.h>
++
++typedef struct {
++    float power[32];  /* about one second; allow WakeNet to report after the word */
++    unsigned at, count;
++} muse_wake_energy_t;
++
++static inline void muse_wake_energy_feed(muse_wake_energy_t *g, float db)
++{
++    g->power[g->at] = powf(10.0f, db / 10.0f);
++    g->at = (g->at + 1) % 32;
++    if (g->count < 32) g->count++;
++}
++
++static inline bool muse_wake_energy_accept(const muse_wake_energy_t *g, float floor_db)
++{
++    if (!g->count) return false;
++    /* Match energy to the recent phrase, not just the quiet end at the
++     * detector's report. Keep the +12 dB requirement over a 256 ms window. */
++    unsigned width = g->count < 8 ? g->count : 8;
++    double sum = 0, best = 0;
++    unsigned oldest = (g->at + 32 - g->count) % 32;
++    for (unsigned i = 0; i < g->count; i++) {
++        sum += g->power[(oldest + i) % 32];
++        if (i >= width) sum -= g->power[(oldest + i - width) % 32];
++        if (i + 1 >= width && sum > best) best = sum;
++    }
++    return best / width >= powf(10.0f, (floor_db + 12.0f) / 10.0f);
++}
++
++static inline bool muse_wake_allowed(bool playback_recent, int64_t now_us,
++                                     int64_t cooldown_us, bool self_test)
++{
++    return self_test || (!playback_recent && now_us >= cooldown_us);
++}
 diff --git a/esp32/components/muse/wake_test.pcm b/esp32/components/muse/wake_test.pcm
 new file mode 100644
 index 0000000000000000000000000000000000000000..8c25a78ff1547fa410ac829d4bb15f8e3610fec0
@@ -3926,6 +4112,120 @@ index 0000000..d99fbde
 +        self.assertGreaterEqual(len(decoded),len(samples));self.assertLess(len(decoded)-len(samples),505)
 +        error=sum(abs(a-b) for a,b in zip(samples,decoded))/len(samples)
 +        self.assertLess(error,500)
+diff --git a/esp32/tests/test_muse_brain_empty.py b/esp32/tests/test_muse_brain_empty.py
+new file mode 100644
+index 0000000..9db6945
+--- /dev/null
++++ b/esp32/tests/test_muse_brain_empty.py
+@@ -0,0 +1,108 @@
++import os, shlex, subprocess, tempfile, unittest
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++class EmptyTranscription(unittest.TestCase):
++ @classmethod
++ def setUpClass(cls):
++  cls.tmp=tempfile.TemporaryDirectory();cls.addClassCleanup(cls.tmp.cleanup)
++  out=Path(cls.tmp.name);cls.exe=out/'empty'
++  src=(ROOT/'components/muse/muse_chat_session.cpp').read_text()
++  stt=src[src.index('static bool brain_stt('):src.index('/* Chat: appends the prompt')]
++  voice=src[src.index('static void brain_voice_reply(void)\n{'):src.index('static void brain_text_turn(const char *text)\n{')]
++  vsrc=(ROOT/'components/muse/muse_voice.c').read_text()
++  reply=vsrc[vsrc.index('static bool hatch_reply('):vsrc.index('static void go_idle(const char *caption)\n{')].replace('static const int16_t silence[MUSE_AUDIO_CHUNK];','static const int16_t silence[MUSE_AUDIO_CHUNK] = {};')
++  wait=vsrc[vsrc.index('static bool wait_delivered('):vsrc.index('/*',vsrc.index('static bool wait_delivered(')+1)]
++  header=(ROOT/'components/muse/muse_chat.h').read_text()
++  enum=header[header.index('typedef enum {\n    MUSE_HATCH_EV_NONE'):header.index('} muse_hatch_ev_t;')+len('} muse_hatch_ev_t;')]
++  code=r"""
++#include <cassert>
++#include <cstdint>
++#include <cstring>
++#include <cstdio>
++#include <cstddef>
++#include <string>
++#define BRAIN_BOUNDARY "test"
++#define BRAIN_STT_MODEL "test"
++#define BRAIN_STT_LANG "zh"
++#define BRAIN_STT_PROMPT "test"
++#define BRAIN_STT_URL "https://test.example/stt"
++#define BRAIN_CHAT_KEY "fake"
++#define NOTE_MAX_BYTES 2048
++template<typename... Args> static void test_log(Args...) {}
++static const char *TAG="test";
++#define ESP_LOGI test_log
++#define ESP_LOGW test_log
++#define ESP_LOGE test_log
++#define strlcpy host_strlcpy
++#define MUSE_AUDIO_CHUNK 320
++#define MUSE_AUDIO_RATE 16000
++#define MUSE_CAPTION_MAX 2048
++#define MUSE_MODE_THINKING 1
++#define MUSE_MODE_SPEAKING 2
++#define ACK_WAIT_US 1000000
++#define MUSE_PTT_DOWN 1
++#define pdMS_TO_TICKS(x) (x)
++"""+enum+r"""
++static char storage[4096],sink[128],caption[128];
++static uint8_t wav[256];
++static uint8_t *s_brain_post=(uint8_t *)storage,*s_brain_note=wav;
++static char *s_http_sink=sink;
++static size_t s_brain_note_len=sizeof(wav),s_http_sink_len;
++static int requests,responses,failures,finishes,audio_writes;
++static float s_reply_max_lvl;
++static bool transport_ok=true,malformed=false;
++static const char *transcript="";
++static muse_hatch_ev_t pending=MUSE_HATCH_EV_NONE;
++static size_t strlcpy(char *out,const char *in,size_t n){size_t len=strlen(in);if(n){size_t take=len<n-1?len:n-1;memcpy(out,in,take);out[take]=0;}return len;}
++static size_t wav_trim_silence(uint8_t *,size_t n){return n;}
++static bool brain_http_cancelled(){return false;}
++static bool openai_perform(const char*,const char*,const char*,const char*,size_t,int){requests++;s_http_sink_len=2;strcpy(sink,"{}");return transport_ok;}
++struct cJSON{};
++static cJSON root,item;
++static cJSON *cJSON_Parse(const char*){return malformed?nullptr:&root;}
++static cJSON *cJSON_GetObjectItem(cJSON*,const char*){return &item;}
++static const char *cJSON_GetStringValue(cJSON*){return transcript;}
++static void cJSON_Delete(cJSON*){}
++static void emit(muse_hatch_ev_t ev,const char *text){pending=ev;strlcpy(caption,text,sizeof(caption));}
++static void turn_finish(){finishes++;}
++static void turn_fail(const char *why){failures++;emit(MUSE_HATCH_EV_ERROR,why);}
++static void brain_respond(const char*,bool,bool){responses++;}
++static void muse_state_set_mode(int){}
++static void muse_state_set_caption(const char*,...){}
++static void muse_state_set_level(float){}
++static void go_idle(const char *text){strlcpy(caption,text,sizeof(caption));}
++static muse_hatch_ev_t muse_hatch_turn_event(char *text,size_t n){auto ev=pending;pending=MUSE_HATCH_EV_NONE;strlcpy(text,caption,n);return ev;}
++static bool muse_hatch_turn_caption(size_t,char*,size_t){return false;}
++static bool got_event(int){return false;}
++static void muse_hatch_turn_cancel(){}
++static size_t muse_hatch_turn_read(int16_t*,size_t,int){return 0;}
++static float muse_audio_level(int16_t*,size_t){return 0;}
++static void muse_audio_write(const int16_t*,size_t){audio_writes++;}
++static int64_t esp_timer_get_time(){return 1;}
++static void vTaskDelay(int){}
++"""+stt+voice+reply+wait+r"""
++int main(int argc,char **argv){
++ assert(argc==2);std::string mode=argv[1];
++ if(mode=="speech")transcript="正常问题";
++ if(mode=="transport")transport_ok=false;
++ if(mode=="malformed")malformed=true;
++ brain_voice_reply();
++ if(mode=="speech") {assert(requests==1 && responses==1 && !failures);return 0;}
++ if(mode=="transport" || mode=="malformed") {
++  assert(!responses && failures==1 && pending==MUSE_HATCH_EV_ERROR);
++  bool handled=false;assert(!hatch_reply(&handled) && !handled);return 0;
++ }
++ assert(requests==1 && !responses && !failures && finishes==1 && pending==MUSE_HATCH_EV_DISCARDED);
++ if(mode=="awake") {bool handled=false;assert(!hatch_reply(&handled) && handled && !audio_writes);assert(!strcmp(caption,"DIDN'T CATCH THAT"));}
++ else {assert(mode=="asleep" && wait_delivered());}
++}
++"""
++  p=out/'empty.cpp';p.write_text(code)
++  r=subprocess.run([*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-Wall','-Wextra','-Werror',str(p),'-o',str(cls.exe)],capture_output=True,text=True)
++  if r.returncode:raise AssertionError(r.stdout+r.stderr)
++ def check(self,mode):subprocess.run([str(self.exe),mode],check=True,capture_output=True)
++ def test_empty_note_is_discarded_without_chat_or_retry_awake(self):self.check('awake')
++ def test_empty_saved_note_is_discarded_without_retry_asleep(self):self.check('asleep')
++ def test_valid_speech_still_reaches_chat(self):self.check('speech')
++ def test_transport_failure_retains_retry_behavior(self):self.check('transport')
++ def test_malformed_response_retains_retry_behavior(self):self.check('malformed')
 diff --git a/esp32/tests/test_muse_brain_http.py b/esp32/tests/test_muse_brain_http.py
 new file mode 100644
 index 0000000..06574dc
@@ -4263,7 +4563,7 @@ index 0000000..06574dc
 +                self.assertEqual(r.returncode,0,r.stdout+r.stderr)
 diff --git a/esp32/tests/test_muse_brain_stream.py b/esp32/tests/test_muse_brain_stream.py
 new file mode 100644
-index 0000000..58e4479
+index 0000000..d5e8476
 --- /dev/null
 +++ b/esp32/tests/test_muse_brain_stream.py
 @@ -0,0 +1,130 @@
@@ -4282,7 +4582,7 @@ index 0000000..58e4479
 +        helpers = src[src.index('static bool same_https_origin('):src.index('/* Own the SSL transports')]
 +        context = src[src.index('struct brain_stream_t {'):src.index('static bool s_tts_overflow;')]
 +        feed = src[src.index('static void brain_chat_data(const char *data, size_t len)\n{'):src.index('/* Streams the reply: each finished sentence')]
-+        stream = src[src.index('static bool brain_chat_stream('):src.index('static void brain_hist_add(')]
++        stream = src[src.index('static bool brain_chat_stream('):src.index('/* Wake/echo transcripts must not teach')]
 +        code = r'''
 +#include <cassert>
 +#include <cstdio>
@@ -4651,10 +4951,10 @@ index 0000000..74a1633
 +            self.assertEqual(dumps, 2)
 diff --git a/esp32/tests/test_muse_speech_guard.py b/esp32/tests/test_muse_speech_guard.py
 new file mode 100644
-index 0000000..e86f215
+index 0000000..eed7d59
 --- /dev/null
 +++ b/esp32/tests/test_muse_speech_guard.py
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,56 @@
 +import os, shlex, subprocess, tempfile, unittest
 +from pathlib import Path
 +ROOT=Path(__file__).resolve().parents[1]
@@ -4695,6 +4995,17 @@ index 0000000..e86f215
 + muse_speech_guard_t talk={.floor_db=-65};
 + for(int i=0;i<750;i++) muse_speech_guard_feed(&talk,-56,20);
 + assert(talk.speech && !muse_speech_guard_stop(&talk));
++ assert(muse_speech_guard_accept(&talk));
++ assert(!muse_speech_guard_accept(&brief)); // 80 ms of noise cannot become an utterance.
++ muse_speech_guard_t threshold={.floor_db=-80};
++ for(int i=0;i<19;i++) muse_speech_guard_feed_vad(&threshold,-72,20,true);
++ assert(threshold.voiced_ms==380 && !muse_speech_guard_accept(&threshold));
++ muse_speech_guard_feed_vad(&threshold,-72,20,true);
++ assert(threshold.voiced_ms==400 && muse_speech_guard_accept(&threshold));
++ // Several short clicks, even with VAD hangover, must not count as 400 ms of speech.
++ muse_speech_guard_t taps={.floor_db=-63};
++ for(int i=0;i<25;i++) muse_speech_guard_feed_vad(&taps,i%10<4 ? -42 : -62,20,true);
++ assert(taps.voiced_ms==240 && !muse_speech_guard_accept(&taps));
 +}
 +""")
 +            binary=out/'guard'
@@ -4725,3 +5036,83 @@ index 8403bec..babb820 100644
          types = source[source.index('enum phase_t'):source.index('/* 10 KB')]
          note = source[source.index('static bool send_note_part('):source.index('static void send_chat(')]
          code = r'''
+diff --git a/esp32/tests/test_muse_wake_guard.py b/esp32/tests/test_muse_wake_guard.py
+new file mode 100644
+index 0000000..249aae4
+--- /dev/null
++++ b/esp32/tests/test_muse_wake_guard.py
+@@ -0,0 +1,74 @@
++import os, shlex, subprocess, tempfile, unittest
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++class WakeGuard(unittest.TestCase):
++ def test_echo_cooldown_energy_and_explicit_selftest(self):
++  with tempfile.TemporaryDirectory() as tmp:
++   src=Path(tmp)/'wake.c';exe=Path(tmp)/'wake'
++   src.write_text(r"""
++#include <assert.h>
++#include "muse_wake_guard.h"
++int main(void) {
++ assert(!muse_wake_allowed(true, 9999999, 0, false));
++ assert(!muse_wake_allowed(false, 1999999, 2000000, false));
++ assert(muse_wake_allowed(false, 2000000, 2000000, false));
++ assert(muse_wake_allowed(true, 1, 2000000, true));
++ muse_wake_energy_t quiet={0};
++ assert(!muse_wake_energy_accept(&quiet,-61));
++ for(int i=0;i<16;i++) muse_wake_energy_feed(&quiet,-54);
++ assert(!muse_wake_energy_accept(&quiet,-61)); // the reported echo: only +7dB
++ muse_wake_energy_t low={0}, voice={0};
++ for(int i=0;i<8;i++) {
++  muse_wake_energy_feed(&low,-49.1f);
++  muse_wake_energy_feed(&voice,-48.9f);
++ }
++ assert(!muse_wake_energy_accept(&low,-61));
++ assert(muse_wake_energy_accept(&voice,-61));
++ // Relative threshold: a quiet real voice may pass a quiet local floor.
++ assert(muse_wake_energy_accept(&low,-70));
++ assert(!muse_wake_energy_accept(&voice,-50));
++ // A late candidate may refer to speech before its quiet trailing frames.
++ for(int i=0;i<12;i++) muse_wake_energy_feed(&voice,-65);
++ assert(muse_wake_energy_accept(&voice,-61));
++ for(int i=0;i<32;i++) muse_wake_energy_feed(&voice,-65);
++ assert(!muse_wake_energy_accept(&voice,-61));
++ // A stale loud frame must age out before a later quiet false detection.
++ muse_wake_energy_feed(&quiet,-10);
++ assert(muse_wake_energy_accept(&quiet,-61));
++ for(int i=0;i<32;i++) muse_wake_energy_feed(&quiet,-60);
++ assert(!muse_wake_energy_accept(&quiet,-61));
++}
++""")
++   subprocess.run([*shlex.split(os.environ.get('CC','cc')),'-std=c11','-Wall','-Wextra','-Werror','-I',str(ROOT/'components/muse'),str(src),'-lm','-o',str(exe)],check=True,capture_output=True)
++   subprocess.run([str(exe)],check=True,capture_output=True)
++
++ def test_wake_echo_history_is_filtered_without_losing_real_questions(self):
++  src=(ROOT/'components/muse/muse_chat_session.cpp').read_text()
++  code=src[src.index('static bool brain_echo_text('):src.index('/* Injects the reply into the normal turn pipeline:')]
++  with tempfile.TemporaryDirectory() as tmp:
++   p=Path(tmp)/'history.cpp';exe=Path(tmp)/'history'
++   p.write_text(r"""
++#include <cassert>
++#include <cstring>
++#include <cstddef>
++#define strlcpy host_strlcpy
++#define BRAIN_HIST_MSGS 4
++#define BRAIN_HIST_LEN 512
++static char history[BRAIN_HIST_MSGS * BRAIN_HIST_LEN];
++static char *s_brain_hist=history;
++static int s_brain_hist_n;
++static size_t strlcpy(char *out,const char *in,size_t n) {size_t len=strlen(in);if(n){size_t take=len<n-1?len:n-1;memcpy(out,in,take);out[take]=0;}return len;}
++"""+code+r"""
++int main(void) {
++ brain_hist_add("High ESP.快衣托。","有什么问题？");assert(s_brain_hist_n==0);
++ brain_hist_add("hello","Hi ESP, what do you need?");assert(s_brain_hist_n==0);
++ brain_hist_add("hI, e s p!","answer");assert(s_brain_hist_n==0);
++ brain_hist_add("为什么天空是蓝色？","因为短波散射。");assert(s_brain_hist_n==2);
++ brain_hist_add("hi","请直接提问。");assert(s_brain_hist_n==4);
++ brain_hist_add("一加一？","二。");assert(s_brain_hist_n==4 && !strcmp(history,"hi"));
++ assert(!brain_echo_text("请解释ESPN节目"));
++}
++""")
++   r=subprocess.run([*shlex.split(os.environ.get('CXX','c++')),'-std=c++17','-Wall','-Wextra','-Werror',str(p),'-o',str(exe)],capture_output=True,text=True)
++   self.assertEqual(r.returncode,0,r.stdout+r.stderr)
++   subprocess.run([str(exe)],check=True,capture_output=True)

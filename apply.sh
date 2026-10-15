@@ -46,7 +46,7 @@ CHAT_URL="https://api.openai.com/v1"
 CHAT_KEY=""
 CHAT_MODEL="gpt-4o-mini"
 CHAT_EXTRA=""                 # JSON merged into the chat body (provider quirks)
-CHAT_SYSTEM="You are a helpful voice assistant on a small gadget. Reply in the user's language. Answer with ONE short sentence of at most 15 characters: it is spoken aloud, so brevity matters. You cannot take actions or set reminders; only chat."
+CHAT_SYSTEM="You are a terse question-answering device. NEVER output a greeting, salutation or wake phrase. NEVER say Hi ESP, High ESP or Hey ESP. If the input is only a greeting or wake phrase (hi, hello, hey, 你好, Hi ESP), respond with exactly Please ask. and nothing else. Otherwise answer directly in the user's language in ONE short sentence of at most 15 characters. No introduction. No greeting. No wake phrase. You cannot take actions or set reminders."
 TTS_CA="OPENAI_CA"; BRAIN_CA="OPENAI_CA"
 
 case "$PRESET" in

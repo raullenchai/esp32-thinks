@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.9 — 2026-10-14 — prevent reply echoes from waking another turn
+
+Wake detection is gated during speaker playback and its 1.5 s tail. Its two-second turn cooldown is now measured after the reply path returns. The previous cooldown ran before reply playback and could expire too early. Manual PTT remains available through both gates.
+
+- **Reject weak wake candidates** — require recent microphone RMS at least 12 dB over adaptive background. Reset WakeNet and partial audio when closing the gate. Explicit `k` self-test bypasses time gates only; routine testing uses typed input and silent PTT.
+- **Stop echo reinforcement** — the system prompt forbids greeting/wake-phrase replies and specifies `Please ask.` for greeting-only input. Exclude wake-phrase transcripts/replies from history and keep two exchanges.
+- **Complete quiet-note handling** — require 400 ms of qualified speech before upload. A valid empty STT result discards the note with `DIDN'T CATCH THAT`, without chat/TTS or saved-note retries; transport/malformed-response failures retain retries. This includes the pending stage-5 fixes.
+- **Validation** — Watcher/AIPI builds, prompt checks and clean SDK patch application pass. The host suite ran 267 tests without failures (3 environment skips); real-crypto pairing also passes with IDF loaded. Typed turns took 1.7–2.7 s and 60 s awake idle had zero accepted wakes. The one allowed acoustic attempt did not complete; the final energy-window revision remains acoustically unverified. Full receipts and the remaining STT latency limit are recorded in [the reference](docs/REFERENCE.md#wake-echo-suppression-v029).
+
 ## v0.2.7 — 2026-10-14 — cancel interrupted HTTP work and discard quiet recordings
 
 Interrupting speech now cancels the old generation through asynchronously polled HTTP I/O, including TLS setup. The HTTP owner then discards the old brain/speech clients and decoder buffers. Normal completed turns keep their prepared connections.

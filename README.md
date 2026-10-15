@@ -8,7 +8,7 @@
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-green"></a>
   <img alt="ESP-IDF v6.0.1" src="https://img.shields.io/badge/ESP--IDF-v6.0.1-blue">
   <img alt="board" src="https://img.shields.io/badge/board-SenseCAP%20Watcher-black">
-  <a href="https://github.com/raullenchai/esp32-thinks/pull/2"><img alt="v0.2" src="https://img.shields.io/badge/status-v0.2.7-orange"></a>
+  <a href="https://github.com/raullenchai/esp32-thinks/tree/v0.2.9"><img alt="v0.2.9" src="https://img.shields.io/badge/status-v0.2.9-orange"></a>
 </p>
 
 **A multi-model Muse — a personal AI assistant on ESP32, talking out of the box.**
@@ -34,11 +34,13 @@ esp32-thinks flips that. The device runs **your** stack: pick the cheapest trans
 | Typed turn (serial console) | — | **1.9–2.6 s** cold or warm |
 | STT upload | full PCM WAV | **¼ size** (IMA ADPCM in a WAV container) |
 | TLS setup | handshake per turn | **long-lived connection** — prepared at boot, kept warm by a 180 s probe, TLS 1.3 session resumption on reconnect; a dead connection is rebuilt in the background, never on the question path |
-| Interrupt a reply (press PTT) | — | in-flight HTTP work cancelled in **< 20 ms**; the next turn stays fast |
+| Interrupt a reply (press PTT) | — | in-flight HTTP work cancelled in **< 20 ms**; cancelled work is not replayed |
 | Silence after an interrupt | records the full window, uploads noise | recording exits after **~3 s** of quiet, nothing is uploaded |
 | Wedge (rare DMA fault) | hangs until power cycle | full task dump, then **auto-reboot ≈ 24 s** |
 
 Measured on the QuickSilver preset (qwen3.7-flash + whisper-large-v3-turbo + qwen3-tts/chatterbox) over Wi-Fi. Details: [LATENCY-v0.2.4](docs/LATENCY-v0.2.4.md) · [STABILITY-v0.2.5](docs/STABILITY-v0.2.5.md) · [REFERENCE §idle maintenance](docs/REFERENCE.md#idle-connection-maintenance).
+
+v0.2.9 adds wake echo gates and stricter no-speech handling. Its device checks and acoustic-test limit are recorded in [the reference](docs/REFERENCE.md#wake-echo-suppression-v029); the separate post-interruption STT latency target is still under investigation. The performance table above records earlier v0.2.7 measurements.
 
 ## What you get
 
@@ -51,7 +53,7 @@ Measured on the QuickSilver preset (qwen3.7-flash + whisper-large-v3-turbo + qwe
 - **Automatic stall recovery** — outstanding I2S or LCD work gets a 20 s deadline, followed by a zero-allocation task dump and reboot. Normal sleep and slow cloud responses don't count as stalls.
 - **Language-aware voice** — Chinese turns can use a different (better) TTS model than English ones, picked automatically from the transcript.
 - **Headless provisioning** — put your Wi-Fi in the config; the device self-provisions on boot. No app, no BLE dance, no vendor account needed.
-- **Typed turns speak too** — the serial console path gets the same treatment (useful for testing without talking).
+- **Typed turns exercise chat and TTS** — the serial console path runs the same inference and decoding pipeline without microphone capture.
 
 ## At a glance
 
@@ -125,12 +127,14 @@ The USB serial port (`/dev/ttyACM1`) is a full console, handy for bench testing:
 | Input | Does |
 |---|---|
 | hold knob / `d`…`u` | simulate PTT down/up |
-| `k` | self-test: plays the wake phrase through the speaker, then a full voice turn |
-| `>chat=hello?` | typed turn — same brain path, spoken reply |
+| `k` | audible self-test: plays the wake phrase through the speaker, then a full voice turn |
+| `>chat=hello?` | typed turn — same chat/TTS pipeline |
 | `>tasks` | dump every task backtrace (works even while wedged) |
 | `>status` | heartbeats: Wi-Fi, heap, DMA, tunnel |
 | `z` / `w` | sleep / wake |
 | `p` | screenshot over serial |
+
+Use `>chat=` for routine checks and `d`/`u` for silent PTT input. Reserve `k` for a deliberate acoustic wake check; avoid loops that repeatedly play the wake phrase.
 
 ## Built on muse-gadget-sdk
 
