@@ -150,6 +150,60 @@ PTT release → record finalized (min 0.3 s, else "DIDN'T CATCH THAT")
 
 Short replies can use one session: after the chat HTTP response is fully consumed, speech reuses its client when HTTPS authority and pinned roots match. Replies up to 128 UTF-8 bytes are batched for one speech request; longer replies use a separate speech client while chat continues streaming. `perform()` and its data callback retain the client state correctly; the manual `open()` path in IDF 6 started a new connection each turn. A stale socket gets one immediate retry before any reply data arrives. TLS 1.3 tickets are saved after reading response headers and scoped to the provider origin; changing hosts discards the old ticket. A HEAD request prepares the connection after Wi-Fi becomes ready (and before recording if no client exists); a 405 response is expected for a POST-only transcription endpoint and still establishes authenticated TLS.
 
+## Idle connection maintenance
+
+The brain client sends an authenticated HEAD to its STT endpoint (or chat endpoint if no STT URL is configured) every 180 seconds when no turn is active and no command is queued. This does not run a transcription or model inference. The existing connection is actually probed; the old warmup fast path that only checked whether a client existed cannot mask a dead socket.
+
+Probes run on the HTTP owner's task, with the existing CPU maximum-frequency lock held during the request, including a possible 40 MHz resting configuration. A 405 response is expected at the POST-only transcription endpoint. A failed request or closed socket clears preparation and destroys the stale client and transport. Preparation retries automatically after one second, with exponential backoff capped at 60 seconds. HEAD uses a 5-second I/O timeout; subsequent normal requests reset their timeout to 30 seconds. A synchronous probe already in progress can briefly delay a newly queued command, although active or already-queued turns prevent a probe from starting.
+
+Both awake idle and resting idle are covered while Wi-Fi is available. The original battery policy turns Wi-Fi off after two minutes of low-power rest, which is shorter than the keepalive interval; connection maintenance does not force the radio back on. It resumes when Wi-Fi returns. Resting queue waits are finite and follow the deadline, with an offline check at most once per minute.
+
+The connection-cut check used a temporary test build: immediately before the first keepalive, it called `shutdown()` on the existing client socket. This simulates an unusable connection without changing Wi-Fi or provider credentials. It is not a server-process restart. The test code was removed from the final source, patch, and firmware.
+
+```text
+I (7897)  brain: HTTPS connected (chat/STT)
+I (8066)  brain: warmup ok
+W (188229) TEST ONLY: cut idle HTTPS connection before keepalive
+I (188263) brain: keepalive failed; rewarming
+I (190899) brain: HTTPS connected (chat/STT)
+I (191068) brain: warmup ok
+I (191503) typed turn: 27 bytes
+I (194272) turn done: 1 message(s) in 2.8s
+I (371321) brain: keepalive ok
+```
+
+The follow-up typed turn and the subsequent keepalive had no new HTTPS-connection event. Automatic preparation completed about 2.8 s after the failed probe (including its one-second retry delay). The final Watcher and AIPI builds pass, with 16% and 47% app-slot space free. All 254 host tests completed, with two skips for the Jetson's missing PSA development library and FFmpeg IMA ADPCM decoder. The final patch applies cleanly through `apply.sh` against SDK `812c46f`.
+
+Typed question: `天空为什么是蓝的？`. Each cold sample reset the device, waited for the logged boot warmup plus one second, then sent the question. Warm samples followed on the last boot, two seconds apart. These are device-cold samples with background connection preparation, not cold model-provider measurements.
+
+| Sample | SDK turn duration | New HTTPS connections during the question |
+|---|---:|---:|
+| Cold 1 | 2.3 s | 0 |
+| Cold 2 | 2.1 s | 0 |
+| Cold 3 | 1.9 s | 0 |
+| Warm 1 | 2.3 s | 0 |
+| Warm 2 | 2.0 s | 0 |
+| Warm 3 | 2.0 s | 0 |
+
+The HTTPS event is emitted only for an actual connect in IDF's client; the six questions emitted none. Turn duration is the existing SDK `turn done` measurement, which ends when reply audio has been queued rather than measuring the physical end of playback. Model-provider variation still applies.
+
+On the final production build, the last cold-test boot logged warmup at 8.019 s and successful probes at 188.341 s and 368.595 s. No additional HTTPS-connect event occurred between them. The last scheduled warm question finished at 24.861 s, leaving more than five minutes without questions before the second probe. Voice detections and health counters kept moving; internal free heap rose from roughly 6 KB to 10 KB rather than declining.
+
+```text
+I (7846)   brain: HTTPS connected (chat/STT)
+I (8019)   brain: warmup ok
+I (188341) brain: keepalive ok
+I (368595) brain: keepalive ok
+I (383559) typed turn: 27 bytes
+I (386411) turn done: 1 message(s) in 2.9s
+```
+
+The extra post-probe question verified HEAD-to-POST reuse after the long idle window. It completed in 2.9 s with zero new HTTPS-connect events; that sample is retained alongside the six scheduled cold/warm measurements rather than omitted from the timing record. No new TLS was logged; this measurement alone does not isolate the source of the extra delay.
+
+Production firmware SHA-256: `1f69d1506113f62f32ac9bf00339a74568f16e5a4a15ef33d9f93a206a08a6e8`. Patch SHA-256: `8edb582ec4fbf29deccfd5845ed8157dff4077b74d7e107443db461ff50b3e8f`.
+
+The v0.2.5 peripheral watchdog remains enabled. This connection-maintenance check does not establish that the underlying DMA fault is resolved.
+
 ## Earlier latency receipts (v0.2.0)
 
 The v0.2.4 measurements and conditions are recorded in the [changelog](../CHANGELOG.md).

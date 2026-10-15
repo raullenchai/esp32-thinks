@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.6 — 2026-10-14 — keep the brain connection ready while idle
+
+The brain HTTP client now receives a HEAD probe every **180 seconds** while idle and Wi-Fi is available. A dead connection is discarded and rebuilt in the background, rather than waiting for the next question. Existing battery Wi-Fi nap remains; probes pause while its radio is off.
+
+- **Resting deadlines** — replace the brain mode's indefinite resting queue wait with a maintenance deadline; cap offline resting checks at one minute. Active turns and queued commands take priority.
+- **Real preparation status** — HEAD must complete successfully and leave a reusable socket. A 405 response is acceptable; HTTP server errors and `Connection: close` do not mark the connection prepared. Wi-Fi loss and missing clients also clear preparation.
+- **Bounded retry and power** — probes use a 5 s I/O timeout and acquire/release the existing CPU maximum-frequency lock. Failed probes retry after 1 s, then back off to at most 60 s; successful probes resume the 180 s cadence. Normal requests restore their 30 s timeout.
+- **Validation** — production probes succeeded at 188 s and 369 s without reconnecting. An injected connection cut triggered failed keepalive, automatic re-warm, then a successful query and later probe. Three device-cold typed turns took 2.3/2.1/1.9 s; three warm turns took 2.3/2.0/2.0 s, all without new TLS on the question path. An additional post-idle turn took 2.9 s with no new TLS. Watcher/AIPI builds, 254 host tests (2 environment skips), and clean SDK `apply.sh` verification pass. [Receipts and power limits](docs/REFERENCE.md#idle-connection-maintenance).
+
 ## v0.2.5 — 2026-10-14 — recover quickly from peripheral stalls
 
 Outstanding audio or LCD work now triggers the zero-allocation coroner after **20 s**, then reboots after the 3 s log-drain interval. Idle time and cloud response time do not count as peripheral stalls. This is a reboot recovery path; the underlying DMA/SPI fault remains unresolved.
