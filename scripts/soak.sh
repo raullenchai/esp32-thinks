@@ -9,6 +9,7 @@ ESPTOOL=${ESPTOOL:-$HOME/.espressif/python_env/idf6.0_py3.12_env/bin/esptool}
 LOG=${LOG:-$HOME/muse-serial.log}
 OUT=${OUT:-$HOME/soak}
 MAX_TURN_S=${MAX_TURN_S:-30}
+IDLE_S=${SOAK_IDLE_S:-900}   # long enough to catch the ~10 min stall; 0 = quick check
 mkdir -p "$OUT"
 
 DATE=$(date +%F)
@@ -118,6 +119,11 @@ if [ -n "${PORT:-}" ]; then
         esac
     done
 fi
+note ""
+
+note "## idle window"
+note "- waiting ${IDLE_S}s for long-tail stalls (SOAK_IDLE_S; 0 skips)"
+if [ "$IDLE_S" -gt 0 ]; then sleep "$IDLE_S"; fi
 note ""
 
 note "## log signatures (this soak's window)"

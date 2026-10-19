@@ -16,10 +16,12 @@ into):
 2. waits for boot + Wi-Fi + brain warmup
 3. finds the console port (enumeration order shuffles between replugs)
 4. runs three typed turns — English, 中文, 한국어 — and records turn latency
-5. scans the soak's slice of the serial log for failure signatures:
+5. idles for `SOAK_IDLE_S` (default 900 s) so long-tail stalls land inside the
+   window; set `SOAK_IDLE_S=0` for a quick check
+6. scans the soak's slice of the serial log for failure signatures:
    `exp_read` spam (wedged I2C bus), panics, aborts, TLS handshake failures,
    coroner reboots
-6. writes `~/soak/soak-YYYY-MM-DD.md` and `~/soak/latest-status`; exits 1 on
+7. writes `~/soak/soak-YYYY-MM-DD.md` and `~/soak/latest-status`; exits 1 on
    any failure
 
 The report from the 21-hour run that found the expander wedge is what became
