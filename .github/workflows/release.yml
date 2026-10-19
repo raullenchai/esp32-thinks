@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract changelog section
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          awk -v hdr="## ${TAG} " '
+            index($0, hdr) == 1 { flag = 1 }
+            flag && index($0, "## ") == 1 && index($0, hdr) != 1 { exit }
+            flag { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "No CHANGELOG section for ${TAG}" >&2
+            exit 1
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          generate_release_notes: false

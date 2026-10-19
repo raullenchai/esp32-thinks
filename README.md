@@ -189,3 +189,9 @@ Top three (full checklist in [REFERENCE](docs/REFERENCE.md#troubleshooting)):
 - **No reply at all?** Check the console for `brain heard:` (transcription worked) and `TTS ok:` — quiet recordings are normally discarded with `DIDN'T CATCH THAT`. `BRAIN STT FAILED` can also indicate transport or response errors; inspect the HTTP log before changing credentials.
 - **`device reports readiness to read but returned no data`** — two processes fighting over `/dev/ttyACM1` (monitor + probe). One at a time.
 - **Garbled flash / boot loop** — you used plain `esptool` at high baud. The CH342 bridge drops whole packets; the recipe uses `paced_esptool` at 115200 for a reason.
+
+## Getting help
+
+- **Questions, setups, provider picks, "look at my build"** — [Discussions](https://github.com/raullenchai/esp32-thinks/discussions).
+- **Bugs** — [open an issue](https://github.com/raullenchai/esp32-thinks/issues/new/choose). Include the serial log: the `version:` line from `>status`, the turn that failed, and `>tasks` if the device froze (or the lines just before `rst:` if it rebooted).
+- **Contributions** — [CONTRIBUTING.md](CONTRIBUTING.md); issues labeled `good first issue` are scoped to be self-contained.

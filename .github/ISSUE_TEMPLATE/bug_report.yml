@@ -1,0 +1,78 @@
+name: Bug report
+description: Something isn't working — a crash, a freeze, a wrong reply, a bad flash.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. The serial log is the single
+        most useful thing you can attach — `>tasks` while frozen and the lines
+        right before a reboot usually identify the culprit.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did the device do instead?
+      placeholder: "Example: pressed the knob, the caption stayed empty, then the device rebooted after ~20 s."
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Firmware version
+      description: The `version:` line from `>status` on the serial console, or the release tag you flashed.
+      placeholder: "v0.2.11"
+    validations:
+      required: true
+  - type: dropdown
+    id: board
+    attributes:
+      label: Board
+      options:
+        - SenseCAP Watcher
+        - AIPI (no display / wake word)
+        - Other / custom
+    validations:
+      required: true
+  - type: dropdown
+    id: preset
+    attributes:
+      label: Provider preset
+      options:
+        - quicksilver
+        - openai
+        - openmuse
+        - custom
+        - Muse cloud only
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How reliably does it happen? Every boot, every N turns, or once?
+      placeholder: |
+        1. Flash with ./apply.sh --preset quicksilver
+        2. Type `>chat=What's the weather?`
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Serial log
+      description: |
+        Paste the relevant part (boot banner, the turn, and anything after it).
+        If the device froze, include the output of `>tasks`; if it rebooted,
+        include the lines just before `rst:...`.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: I'm on the latest release (or `main`), not an older tag.
+          required: true

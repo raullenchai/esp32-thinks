@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & setups
+    url: https://github.com/raullenchai/esp32-thinks/discussions
+    about: Ask how to flash, which provider to pick, or share your build — not a bug report.
+  - name: Read the reference first
+    url: https://github.com/raullenchai/esp32-thinks/blob/main/docs/REFERENCE.md
+    about: Presets, timing receipts, known limits and troubleshooting live here.

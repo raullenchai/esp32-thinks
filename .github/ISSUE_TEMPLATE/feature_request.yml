@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest a capability, provider preset, board port, or docs improvement.
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case, not just the solution. What does the device do today that falls short?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Muse to do? Sketches, config names, and API examples welcome.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other providers, boards, or workarounds you've tried.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Voice / wake word / STT
+        - Brain / chat / TTS providers
+        - Display / UI
+        - Connectivity / provisioning
+        - Build / flashing / SDK patch
+        - Docs
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions for this idea.
+          required: true
