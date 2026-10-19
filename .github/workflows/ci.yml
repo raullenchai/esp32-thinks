@@ -35,7 +35,7 @@ jobs:
       - name: Fetch cJSON for the host harnesses
         run: |
           curl -fsSL https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.18.tar.gz | tar xz
-          mv cJSON-1.7.18/cJSON cjson
+          mv cJSON-1.7.18 cjson
 
       - name: Run the host test suite
         working-directory: sdk/esp32
