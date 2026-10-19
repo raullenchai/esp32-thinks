@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.11 — 2026-10-18 — auto-recover from a wedged I2C expander bus
+
+Found via a real 21-hour soak: the SenseCAP Watcher's I/O expander (buttons/LEDs, on I2C) stopped responding and the input task spun on `exp_read` failures every 60 ms while the rest of the system stayed healthy — heartbeats, Wi-Fi and voice kept running, so neither the task watchdog nor the stall coroner noticed, and the device looked frozen to its owner.
+
+- **Expander bus watchdog** — count consecutive `exp_read` failures; after 1000 (~1 minute of solid failure) log the wedge and reboot cleanly, the same philosophy as the stall coroner. Transient failures (camera rail switching) reset the counter and never trigger it.
+- **Verified** — Watcher build passes; clean SDK clone at `812c46f` accepts the regenerated patch; device reflashed over USB (esptool hard-reset reaches the ROM bootloader even when input is wedged) and passed a 2.5 s typed turn.
+
 ## v0.2.10 — 2026-10-14 — follow the user's language with natural-length replies
 
 The default persona answers in the user's language, falls back to English when unclear, and requests one or two short sentences (~40 words / 60 Chinese characters). It replaces the former 15-character limit. Greeting-only input still returns `Please ask.`; questions containing a greeting must be answered.

@@ -8,7 +8,7 @@
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-green"></a>
   <img alt="ESP-IDF v6.0.1" src="https://img.shields.io/badge/ESP--IDF-v6.0.1-blue">
   <img alt="board" src="https://img.shields.io/badge/board-SenseCAP%20Watcher-black">
-  <a href="https://github.com/raullenchai/esp32-thinks/tree/v0.2.10"><img alt="v0.2.10" src="https://img.shields.io/badge/status-v0.2.10-orange"></a>
+  <a href="https://github.com/raullenchai/esp32-thinks/tree/v0.2.11"><img alt="v0.2.11" src="https://img.shields.io/badge/status-v0.2.11-orange"></a>
 </p>
 
 **A multi-model Muse — a personal AI assistant on ESP32, talking out of the box.**
