@@ -1,0 +1,7 @@
+[Unit]
+Description=Nightly Muse gadget soak (reboot + turn battery + log scan)
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/home/ubuntu/soak.sh

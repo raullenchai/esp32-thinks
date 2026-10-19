@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Muse gadget soak nightly
+
+[Timer]
+# 11:00 UTC = 04:00 America/Los_Angeles
+OnCalendar=*-*-* 11:00:00 UTC
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
