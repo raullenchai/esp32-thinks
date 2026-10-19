@@ -1,0 +1,44 @@
+name: firmware-build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC — catch upstream/dependency drift
+
+env:
+  SDK_PIN: 812c46f
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [watcher, aipi]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: espressif/idf:v6.0.3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone the pristine Muse SDK at the pinned revision
+        run: |
+          git config --global --add safe.directory '*'
+          git clone https://github.com/facebookincubator/muse-gadget-sdk.git /opt/sdk
+          git -C /opt/sdk checkout $SDK_PIN
+
+      - name: Apply the brain patch (headless provider config)
+        run: |
+          printf 'sk-ci-dummy\n\n\nn\ny\n' | ./apply.sh /opt/sdk --preset quicksilver
+
+      - name: Build ${{ matrix.board }}
+        working-directory: /opt/sdk/esp32
+        run: |
+          . $IDF_PATH/export.sh
+          bash tools/muse/board.sh build ${{ matrix.board }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muse-gadget-${{ matrix.board }}
+          path: /opt/sdk/esp32/build-*/muse-gadget.bin
+          if-no-files-found: error

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  SDK_PIN: 812c46f
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CJSON_SOURCE_DIR: ${{ github.workspace }}/cjson
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the shell entry points
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=error apply.sh
+
+      - name: Clone the pristine Muse SDK at the pinned revision
+        run: |
+          git clone https://github.com/facebookincubator/muse-gadget-sdk.git sdk
+          git -C sdk checkout ${{ env.SDK_PIN }}
+
+      - name: Apply the brain patch (also validates it against the pinned upstream)
+        run: |
+          printf 'sk-ci-dummy\n\n\nn\ny\n' | ./apply.sh "$PWD/sdk" --preset quicksilver
+
+      - name: Fetch cJSON for the host harnesses
+        run: |
+          curl -fsSL https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.18.tar.gz | tar xz
+          mv cJSON-1.7.18/cJSON cjson
+
+      - name: Run the host test suite
+        working-directory: sdk/esp32
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
