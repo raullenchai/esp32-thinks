@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.12 — 2026-10-19 — openmuse ships in the repo
+
+The optional agent layer now lives in this repository (`openmuse/`) instead of a separate project: one clone gets the firmware patch and the agent, and `apply.sh --preset openmuse` wires the device to it.
+
+- **In-repo agent** — Hono/Node service with an OpenAI-compatible surface (SSE passthrough); Dockerfile/compose, `.env.example`, and `openmuse/run.sh` (Docker when available, Node otherwise; `--funnel` exposes HTTPS via Tailscale).
+- **Context** — auto-detects the host's city/timezone from its public IP and injects them into every system prompt; weather via open-meteo; "remember/记住" facts persist to disk (`openmuse/data/memories.json`) or KV on Workers.
+- **STT proxy** — `/v1/audio/transcriptions` forwards to the provider, so the device keeps one TLS session for STT + chat.
+- **Preset** — `apply.sh --preset openmuse` points chat and STT at the agent and keeps QuickSilver for TTS; it asks only for the agent URL and token.
+- **CI** — new `openmuse` job (`npm ci` + syntax check); `openmuse/run.sh` is shellchecked.
+- **Verified on device** — weather with no city (auto San Jose), time, memory across a service restart, Chinese STT through the proxy, and a full voice turn (`k` self-test) in 4.7 s; typed warm turns ~3.9 s.
+
 ## v0.2.11 — 2026-10-18 — auto-recover from a wedged I2C expander bus
 
 Found via a real 21-hour soak: the SenseCAP Watcher's I/O expander (buttons/LEDs, on I2C) stopped responding and the input task spun on `exp_read` failures every 60 ms while the rest of the system stayed healthy — heartbeats, Wi-Fi and voice kept running, so neither the task watchdog nor the stall coroner noticed, and the device looked frozen to its owner.
