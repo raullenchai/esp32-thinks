@@ -27,7 +27,12 @@ jobs:
             exit 1
           fi
 
+      - name: Release title from the changelog heading
+        id: title
+        run: echo "name=$(head -n1 notes.md | sed 's/^## //')" >> "$GITHUB_OUTPUT"
+
       - uses: softprops/action-gh-release@v2
         with:
+          name: ${{ steps.title.outputs.name }}
           body_path: notes.md
           generate_release_notes: false
