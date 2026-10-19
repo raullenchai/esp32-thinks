@@ -81,13 +81,34 @@ cd esp32-thinks
 ./scripts/backup-nvs.sh ../muse-gadget-sdk /dev/ttyACM1
 
 # 2) Apply the patch + configure your brain (pick a preset)
-./apply.sh ../muse-gadget-sdk --preset quicksilver   # or openai / custom
+./apply.sh ../muse-gadget-sdk --preset quicksilver   # or openai / openmuse / custom
 
 # 3) Build + flash (CH342-safe pacing; allow several minutes)
 ./build-and-flash.sh ../muse-gadget-sdk /dev/ttyACM1
 ```
 
 With a preset + headless Wi-Fi in step 2, that's the whole setup: unplug, re-plug, and talk — press the knob, or just say "Hi, ESP".
+
+## Own brain: openmuse (optional)
+
+QuickSilver is the fastest path. If you want the gadget to know your city and
+time, answer weather questions, and remember things across turns, run the agent
+that ships in this repo:
+
+```bash
+./openmuse/run.sh              # first run writes openmuse/.env, then exits
+$EDITOR openmuse/.env          # set UPSTREAM_API_KEY + OPENMUSE_TOKEN
+./openmuse/run.sh --funnel     # Docker or Node; --funnel exposes HTTPS via Tailscale
+./apply.sh ../muse-gadget-sdk --preset openmuse
+#   chat URL: https://<host>/v1
+#   token:    OPENMUSE_TOKEN
+```
+
+openmuse sits between the device and any OpenAI-compatible LLM: it owns the
+system prompt, adds location/clock/weather/memory tools, proxies STT (one TLS
+session for STT + chat), and streams the reply through untouched. TTS still goes
+directly to QuickSilver. It needs no domain — a Tailscale Funnel gives it a real
+Let's Encrypt certificate. Details: **[openmuse/README.md](openmuse/README.md)**.
 
 | Command | Does |
 |---|---|
@@ -165,7 +186,7 @@ Everything lives in `esp32/components/muse/provider_config.h` (written by `apply
 | `WAKE_VAD_DB` | End-of-turn silence threshold for wake turns (raise toward -35 if it keeps recording after you stop) |
 | `DEV_WIFI_SSID` / `DEV_WIFI_PASS` | Headless provisioning; empty = normal BLE setup |
 
-Presets: `openai`, `quicksilver`, `openmuse` (STT + chat through your own [openmuse](https://github.com/raullenchai/openmuse) agent — location, weather, time, memory — with QuickSilver for TTS), and `custom`.
+Presets: `openai`, `quicksilver`, `openmuse` (STT + chat through the in-repo [openmuse](openmuse/README.md) agent — location, weather, time, memory — with QuickSilver for TTS), and `custom`.
 
 Changed a define? Re-run `./build-and-flash.sh` — it rebuilds and reflashes.
 

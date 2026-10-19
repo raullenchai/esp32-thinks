@@ -74,7 +74,7 @@ case "$PRESET" in
     ;;
   openmuse)
     echo "== preset: openmuse — QuickSilver TTS + your own openmuse agent (location/time/memory/search)"
-    echo "   https://github.com/raullenchai/openmuse — run it locally or on Cloudflare"
+    echo "   openmuse/README.md — run ./openmuse/run.sh --funnel first"
     TTS_URL="https://api.quicksilverpro.io/v1/audio/speech"
     TTS_MODEL="chatterbox-turbo"; TTS_VOICE=""
     TTS_MODEL_CJK="qwen3-tts"

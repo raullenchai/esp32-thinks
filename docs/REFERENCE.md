@@ -87,6 +87,10 @@ The QuickSilver preset uses chatterbox-turbo for English and qwen3-tts for Chine
 
 Set the independent URLs/models/keys in `provider_config.h`, with the matching pinned public roots. Endpoints can share one provider or use different services. An empty `BRAIN_CHAT_URL` selects the optional stock Muse agent instead. Local OpenAI-compatible services may also be used when their transport and formats meet the firmware's requirements.
 
+### The `openmuse` preset
+
+`openmuse/` in this repo is an optional agent layer between the gadget and any OpenAI-compatible LLM. Run `./openmuse/run.sh` (Docker when available, Node otherwise) after filling `openmuse/.env`; `--funnel` exposes it over HTTPS with a Tailscale certificate. `./apply.sh <sdk> --preset openmuse` then points both `BRAIN_CHAT_URL` and `BRAIN_STT_URL` at it (the agent proxies transcription), keeps QuickSilver for TTS, and asks for the openmuse token. Because STT and chat share one origin, the device keeps one TLS session across a turn; TTS still uses its own connection. Memory lives in `openmuse/data/memories.json` (Node) or the `MEMKV` namespace (Workers). Cloudflare *quick* tunnels are not usable from the device: the hostname is only served by the edge node cloudflared is attached to, and a different edge returns a fatal TLS alert (`-0x2700`).
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

@@ -1,0 +1,19 @@
+{
+  "name": "openmuse",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A tiny agent harness that turns any OpenAI-compatible LLM endpoint into a personal assistant for Muse gadgets.",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node src/node.js",
+    "start": "node src/node.js",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

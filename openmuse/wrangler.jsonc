@@ -1,0 +1,12 @@
+{
+  "name": "openmuse",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "vars": {
+    "DEFAULT_CITY": "Shanghai",
+    "DEFAULT_TZ": "Asia/Shanghai"
+  },
+  "kv_namespaces": [
+    { "binding": "MEMKV", "id": "REPLACE_WITH_YOUR_KV_ID" }
+  ]
+}
