@@ -90,7 +90,8 @@ case "$PRESET" in
     read -r -p "QuickSilver API key (TTS): " KEY
     TTS_KEY="$KEY"
     read -r -p "openmuse token: " K
-    CHAT_KEY=${K:-$KEY}
+    if [[ -z "$K" ]]; then echo "openmuse token is required (it authenticates chat and STT)"; exit 1; fi
+    CHAT_KEY="$K"
     ;;
   custom)
     echo "== preset: custom — enter each endpoint (return = keep the OpenAI default shown)"

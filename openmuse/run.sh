@@ -45,6 +45,6 @@ if [ "${1:-}" = "--funnel" ]; then
 fi
 
 echo
-echo "Next: ./apply.sh --preset openmuse"
+echo "Next (from the repo root): ./apply.sh ../muse-gadget-sdk --preset openmuse"
 echo "  chat URL: https://<host>/v1"
 echo "  token:    $(awk -F= '/^OPENMUSE_TOKEN=/{print $2}' .env)"

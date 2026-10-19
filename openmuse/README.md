@@ -34,7 +34,7 @@ OpenAI-compatible upstream works — no function-calling support required.
 ./openmuse/run.sh                # first run writes openmuse/.env, then exits
 $EDITOR openmuse/.env            # set UPSTREAM_API_KEY + OPENMUSE_TOKEN
 ./openmuse/run.sh --funnel       # starts it and (if Tailscale is present) exposes HTTPS
-./apply.sh --preset openmuse     # chat URL: https://<host>/v1, token: OPENMUSE_TOKEN
+./apply.sh ../muse-gadget-sdk --preset openmuse   # chat URL: https://<host>/v1, token: OPENMUSE_TOKEN
 ```
 
 `run.sh` uses Docker when available (`docker compose up -d --build`) and falls
