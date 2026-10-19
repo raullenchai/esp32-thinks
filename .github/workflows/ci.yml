@@ -36,6 +36,9 @@ jobs:
         run: |
           curl -fsSL https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.18.tar.gz | tar xz
           mv cJSON-1.7.18 cjson
+          # SDK harnesses resolve cJSON from managed_components; a few read CJSON_SOURCE_DIR.
+          mkdir -p sdk/esp32/managed_components/espressif__cjson/cJSON
+          cp -R cjson/. sdk/esp32/managed_components/espressif__cjson/cJSON/
 
       - name: Run the host test suite
         working-directory: sdk/esp32
