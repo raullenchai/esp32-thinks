@@ -212,6 +212,7 @@ Changed a define? Re-run `./build-and-flash.sh` — it rebuilds and reflashes.
 - Custom wake phrases ("Hey Mica") via Espressif's TTS Pipeline V3.
 - Echo-proof wake word (speaker audio must never re-trigger the device), and a root-cause fix for the rare DMA event loss behind the stall reboot.
 - openmuse: nightly memory distillation (turn logs → stable profile facts), plus calendar/contacts connectors.
+- Vision mode (Watcher camera → multimodal model), local timers, music/radio, and MCP/Home Assistant tools. See [docs/IDEAS.md](docs/IDEAS.md) for the community survey and a prioritized list.
 
 Build details and historical receipts: **[docs/REFERENCE.md](docs/REFERENCE.md)**. For contributing and validation, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
