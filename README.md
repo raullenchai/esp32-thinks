@@ -165,6 +165,8 @@ Everything lives in `esp32/components/muse/provider_config.h` (written by `apply
 | `WAKE_VAD_DB` | End-of-turn silence threshold for wake turns (raise toward -35 if it keeps recording after you stop) |
 | `DEV_WIFI_SSID` / `DEV_WIFI_PASS` | Headless provisioning; empty = normal BLE setup |
 
+Presets: `openai`, `quicksilver`, `openmuse` (STT + chat through your own [openmuse](https://github.com/raullenchai/openmuse) agent — location, weather, time, memory — with QuickSilver for TTS), and `custom`.
+
 Changed a define? Re-run `./build-and-flash.sh` — it rebuilds and reflashes.
 
 ## Security notes

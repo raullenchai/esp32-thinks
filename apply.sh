@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # esp32-thinks: apply the brain patch to a muse-gadget-sdk checkout and write your provider config.
 #
-# Usage: ./apply.sh /path/to/muse-gadget-sdk [--preset openai|quicksilver|custom]
+# Usage: ./apply.sh /path/to/muse-gadget-sdk [--preset openai|quicksilver|openmuse|custom]
 #
 # The brain patch gives the device its own STT + chat + TTS against any
 # OpenAI-compatible servers. Each of the three endpoints is independent: they
 # can be the same provider or three different ones.
 set -euo pipefail
 
-SDK=${1:?usage: ./apply.sh /path/to/muse-gadget-sdk [--preset openai|quicksilver|custom]}
+SDK=${1:?usage: ./apply.sh /path/to/muse-gadget-sdk [--preset openai|quicksilver|openmuse|custom]}
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 PRESET="openai"
 if [ "${2:-}" = "--preset" ]; then
     PRESET=${3:-openai}
 elif [ -n "${2:-}" ]; then
-    echo "unknown option: $2 (usage: ./apply.sh <sdk> [--preset openai|quicksilver|custom])"; exit 1
+    echo "unknown option: $2 (usage: ./apply.sh <sdk> [--preset openai|quicksilver|openmuse|custom])"; exit 1
 fi
 
 test -d "$SDK/esp32/components/muse" || { echo "not a muse-gadget-sdk checkout: $SDK"; exit 1; }
@@ -73,21 +73,23 @@ case "$PRESET" in
     TTS_KEY="$KEY"; CHAT_KEY="$KEY"
     ;;
   openmuse)
-    echo "== preset: openmuse — QuickSilver STT/TTS + your own openmuse agent (weather/time/memory/search)"
-    echo "   https://github.com/raullenchai/openmuse — deploy once, fill in the URL"
+    echo "== preset: openmuse — QuickSilver TTS + your own openmuse agent (location/time/memory/search)"
+    echo "   https://github.com/raullenchai/openmuse — run it locally or on Cloudflare"
     TTS_URL="https://api.quicksilverpro.io/v1/audio/speech"
     TTS_MODEL="chatterbox-turbo"; TTS_VOICE=""
     TTS_MODEL_CJK="qwen3-tts"
-    STT_URL="https://api.quicksilverpro.io/v1/audio/transcriptions"
     STT_MODEL="whisper-large-v3-turbo"
     STT_ADPCM=1
     ask() { read -r -p "$1 [$2]: " V; echo "${V:-$2}"; }
-    CHAT_URL=$(ask "openmuse base URL (https://openmuse.<you>.workers.dev/v1)" "")
+    CHAT_URL=$(ask "openmuse base URL (https://<host>/v1)" "")
+    CHAT_URL=${CHAT_URL%/}
+    if [[ -z "$CHAT_URL" ]]; then echo "openmuse URL is required"; exit 1; fi
+    STT_URL="$CHAT_URL/audio/transcriptions"   # proxied: one TLS session for STT + chat
     CHAT_MODEL="qwen3.7-flash"                  # placeholder; openmuse overrides the upstream model
     TTS_CA="ISRG_CA"; BRAIN_CA="ISRG_CA"
-    read -r -p "QuickSilver API key (STT/TTS): " KEY
+    read -r -p "QuickSilver API key (TTS): " KEY
     TTS_KEY="$KEY"
-    read -r -p "openmuse token [same as QuickSilver key]: " K
+    read -r -p "openmuse token: " K
     CHAT_KEY=${K:-$KEY}
     ;;
   custom)
@@ -104,7 +106,7 @@ case "$PRESET" in
     read -r -p "Chat + transcription API key [same as speech]: " K
     CHAT_KEY=${K:-$TTS_KEY}
     ;;
-  *) echo "unknown preset: $PRESET (openai | quicksilver | custom)"; exit 1 ;;
+  *) echo "unknown preset: $PRESET (openai | quicksilver | openmuse | custom)"; exit 1 ;;
 esac
 
 if [[ "$TTS_URL" != *api.openai.com* && "$TTS_CA" == OPENAI_CA ]]; then TTS_CA="ISRG_CA"; fi
