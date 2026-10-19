@@ -92,7 +92,9 @@ system prompt, adds location/clock/weather/memory tools, proxies STT (one TLS
 session for STT + chat), and streams the reply through untouched. TTS still goes
 directly to QuickSilver. It needs no domain — a Tailscale Funnel gives it a real
 Let's Encrypt certificate. Memory lives in `openmuse/data/memories.json`.
-Details: **[openmuse/README.md](openmuse/README.md)**.
+Details: **[openmuse/README.md](openmuse/README.md)**. For the protocol, the
+CopilotKit/OpenMuse boundary, and troubleshooting, see
+**[docs/OPENMUSE.md](docs/OPENMUSE.md)**.
 
 ## Performance (measured on device)
 

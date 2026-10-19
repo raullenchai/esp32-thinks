@@ -98,3 +98,19 @@ npm run deploy
 
 On Workers, location comes from Cloudflare's `cf-ipcity` / `cf-timezone`
 headers instead of ipwho.is (which would geolocate the edge, not the user).
+
+## Tests
+
+```bash
+npm test
+```
+
+Runs the Hono smoke tests: liveness, `/healthz` with edge location headers,
+bearer-token enforcement, and clear errors when the upstream or STT proxy is
+not configured. No network access or credentials are needed.
+
+## See also
+
+- [docs/OPENMUSE.md](../docs/OPENMUSE.md) — protocol, deployment, the
+  CopilotKit/OpenMuse AG-UI boundary, and troubleshooting.
+- [README.md](../README.md) — firmware quick start, presets, and performance.

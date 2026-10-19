@@ -24,6 +24,7 @@ jobs:
           npm ci
           node --check src/index.js
           node --check src/node.js
+          npm test
 
   host-tests:
     runs-on: ubuntu-latest
